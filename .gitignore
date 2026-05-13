@@ -1,0 +1,6 @@
+projectvenv/
+__pycache__/
+images/
+outputs/checkpoints/
+*.pt
+*.pth
