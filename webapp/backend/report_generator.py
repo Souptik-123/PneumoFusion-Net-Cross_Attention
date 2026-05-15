@@ -23,8 +23,9 @@ try:
 except ImportError:
     _OPENAI_AVAILABLE = False
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4.1")  # fallback: gpt-4o
+#OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4.1") 
+#print("using OpenAI model:", OPENAI_MODEL, "API key:", OPENAI_API_KEY) # fallback: gpt-4o
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,45 +151,57 @@ def generate_report(
     clinical_text:    str,
     gradcam_findings: str = "Grad-CAM heatmap highlights regions of lung abnormality.",
 ) -> dict:
-    """
-    Generate a structured medical report via OpenAI.
 
-    Returns a dict with keys:
-        patient_summary, clinical_interpretation, confidence_explanation,
-        key_abnormalities, recommended_actions, emergency_warning_signs,
-        disclaimer, _source ("openai" | "fallback")
+    api_key = os.getenv("OPENAI_API_KEY", "")
 
-    Never raises — returns a fallback report if the API is unavailable.
-    """
-    if not _OPENAI_AVAILABLE or not OPENAI_API_KEY:
-        return _fallback_report(predicted_class, confidence, probabilities, numerical_row, clinical_text)
+    if not _OPENAI_AVAILABLE or not api_key:
+        return _fallback_report(
+            predicted_class,
+            confidence,
+            probabilities,
+            numerical_row,
+            clinical_text
+        )
 
     try:
-        client     = OpenAI(api_key=OPENAI_API_KEY)
+        client = OpenAI(api_key=api_key)
+
         user_prompt = _build_user_prompt(
-            predicted_class, confidence, probabilities,
-            numerical_row, clinical_text, gradcam_findings,
+            predicted_class,
+            confidence,
+            probabilities,
+            numerical_row,
+            clinical_text,
+            gradcam_findings,
         )
 
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_prompt},
+                {"role": "user", "content": user_prompt},
             ],
-            temperature=0.2,           # low temp for factual consistency
+            temperature=0.2,
             max_tokens=1200,
             response_format={"type": "json_object"},
         )
 
-        raw    = response.choices[0].message.content
+        raw = response.choices[0].message.content
         report = json.loads(raw)
         report["_source"] = "openai"
         return report
 
     except Exception as exc:
         print(f"[ReportGenerator] OpenAI error: {exc}")
-        fb = _fallback_report(predicted_class, confidence, probabilities, numerical_row, clinical_text)
+
+        fb = _fallback_report(
+            predicted_class,
+            confidence,
+            probabilities,
+            numerical_row,
+            clinical_text,
+        )
+
         fb["_error"] = str(exc)
         return fb
 

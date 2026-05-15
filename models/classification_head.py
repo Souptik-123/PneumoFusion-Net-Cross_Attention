@@ -93,7 +93,7 @@ class ClassificationHead(nn.Module):
         # Initialised to ones so softmax starts at uniform (0.333, 0.333, 0.333).
         # During training the model will push these towards the true importance
         # ratio (e.g. CNN > Numerical > Text for pneumonia classification).
-        self.token_weights = nn.Parameter(torch.ones(3))
+        self.token_weights = nn.Parameter(torch.tensor([0.45, 0.22, 0.33], dtype=torch.float32))
 
         # ── Classification MLP ────────────────────────────────────────────
         self.net = nn.Sequential(

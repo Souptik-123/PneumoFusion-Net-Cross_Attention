@@ -264,7 +264,7 @@ def render_sidebar():
         # OpenAI key input
         st.markdown("**🔑 OpenAI API Key**")
         st.markdown("<small>Required for AI report generation</small>", unsafe_allow_html=True)
-        api_key = st.text_input(
+        openai_api_key = st.text_input(
             "OpenAI Key", type="password",
             placeholder="sk-...", label_visibility="collapsed",
             key="openai_api_key",

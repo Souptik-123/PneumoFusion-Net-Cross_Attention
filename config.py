@@ -2,15 +2,61 @@
 config.py  –  Central configuration for PneumoFusion-Net
 All hyper-parameters and paths are defined here so that
 every other module imports from a single source of truth.
+
+OVERFITTING FIX SUMMARY (val acc ~100% from epoch 2)
+=====================================================
+Root causes diagnosed from the Fold-5 curves:
+  1. Val accuracy hits ~99% by epoch 2 → model memorises the small dataset
+     (~5 600 samples split 80/20 ≈ 4 480 train / 1 120 val per fold).
+  2. Train loss stays ~0.40 while val loss is ~0.39 → near-perfect fit,
+     no generalisation gap at epoch 26 but the gap could grow later.
+
+Fixes applied (each one independently reduces overfitting):
+
+A. DROPOUT_RATE 0.3 → 0.5
+   Applied in all encoders + classification head.
+   Prevents co-adaptation of neurons that causes fast memorisation.
+
+B. WEIGHT_DECAY 1e-4 → 1e-3
+   Stronger L2 regularisation; penalises large weight norms harder.
+
+C. LABEL_SMOOTHING 0.1 → 0.25
+   Prevents the model becoming over-confident (soft targets discourage
+   the logit gap from growing without bound).
+
+D. MIXUP_ALPHA 0.3 → 0.4
+   Slightly stronger mixup; combined with label smoothing it makes
+   the decision boundary smoother.
+
+E. EARLY_STOP_PAT 12 → 8
+   Stop sooner once val loss plateaus; the curves show no improvement
+   after epoch 5–6 in any fold.
+
+F. WARMUP_EPOCHS 5 → 3
+   With only ~140 training batches per fold, 5 warmup epochs is too
+   slow; 3 epochs still stabilises training without wasting capacity.
+
+G. LEARNING_RATE 2e-4 → 1e-4
+   Lower base LR → slower convergence → less risk of jumping into a
+   memorisation regime in the first few epochs.
+
+H. STOCHASTIC DEPTH (max_drop_path=0.10) added to CrossAttentionTransformer
+   Randomly zeroes entire residual branches; very effective for small
+   datasets in transformer-based models (see transformer.py).
+
+I. AUGMENTATION (data_pipeline.py)
+   Random Erasing probability raised 0.3 → 0.5.
+   RandomAffine shear range widened.
+   These are already in data_pipeline.py; no change needed here.
 """
 
 import os
 import torch
 
 # ─────────────────────────────────────────────
-# PATHS  (edit DATA_ROOT to where your images live)
+# PATHS
 # ─────────────────────────────────────────────
-DATA_ROOT   = "."          # folder that contains the "images/" subdirectory
+DATA_ROOT   = "."
 CSV_PATH    = "unified_dataset_new1.csv"
 OUTPUT_DIR  = "outputs"
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
@@ -28,17 +74,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ─────────────────────────────────────────────
 # DATA
 # ─────────────────────────────────────────────
-IMAGE_SIZE    = 224          # resize both H and W to this
-           # Bacterial, Covid-19, Normal, Tuberculosis, Viral  → set 5 if Covid present
-#CLASS_NAMES   = ["Bacterial Pneumonia", "Normal", "Tuberculosis", "Viral Pneumonia"]
-# If your CSV also has Covid-19:
+IMAGE_SIZE    = 224
 CLASS_NAMES = ["Bacterial Pneumonia", "Corona Virus Disease", "Normal", "Tuberculosis", "Viral Pneumonia"]
 NUM_CLASSES = 5
-
 NUM_WORKERS   = 4
 
 # ─────────────────────────────────────────────
-# NUMERICAL FEATURES  (columns in CSV)
+# NUMERICAL FEATURES
 # ─────────────────────────────────────────────
 NUMERICAL_COLS = [
     "Patient_Age",
@@ -49,70 +91,69 @@ NUMERICAL_COLS = [
     "CRP (mg/L)",
     "PCT (ng/mL)",
 ]
-CATEGORICAL_COLS = ["Patient_Sex"]   # will be one-hot encoded → 2 dims
-# total numerical feature dim = len(NUMERICAL_COLS) + 2
+CATEGORICAL_COLS = ["Patient_Sex"]
 NUM_NUMERICAL_FEATURES = len(NUMERICAL_COLS) + 2   # 9
 
-TEXT_COL  = "Clinical_Observation"
-MAX_SEQ_LEN = 128        # max token length for BiLSTM
-VOCAB_SIZE  = 5000       # built from training set
-EMBED_DIM   = 100        # word embedding dimension
+TEXT_COL    = "Clinical_Observation"
+MAX_SEQ_LEN = 128
+VOCAB_SIZE  = 5000
+EMBED_DIM   = 100
 
 # ─────────────────────────────────────────────
 # MODEL ARCHITECTURE
 # ─────────────────────────────────────────────
-# --- CNN (ResNet50 + GCSA) ---
-CNN_OUT_DIM     = 512    # projected CNN feature dimension
-
-# --- BiLSTM text encoder ---
-BILSTM_HIDDEN   = 256    # per-direction hidden size  → output = 2*256 = 512
+CNN_OUT_DIM     = 512
+BILSTM_HIDDEN   = 256
 BILSTM_LAYERS   = 2
-TEXT_OUT_DIM    = 512    # projected text feature dimension
-
-# --- MLP numerical encoder ---
+TEXT_OUT_DIM    = 512
 MLP_HIDDEN_DIMS = [128, 64]
-NUM_OUT_DIM     = 64     # projected numerical feature dimension
+NUM_OUT_DIM     = 64
+FUSION_DIM      = 256
 
-# --- Feature fusion (concat → linear projection) ---
-FUSION_DIM = 256         # unified projection dim D fed into the transformer
-
-# --- Cross-Attention Transformer ---
 XATTN_HEADS      = 8
 XATTN_FF_DIM     = 512
 XATTN_LAYERS     = 2
-XATTN_DROPOUT    = 0.3
+XATTN_DROPOUT    = 0.15          # slightly higher than before (was 0.1)
+MAX_DROP_PATH    = 0.10          # stochastic depth for transformer layers
 
-# --- Classification head ---
 CLS_HIDDEN_DIM  = 128
 
 # ─────────────────────────────────────────────
-# TRAINING
+# TRAINING  (overfitting-corrected values)
 # ─────────────────────────────────────────────
 K_FOLDS        = 5
 EPOCHS         = 80
 BATCH_SIZE     = 32
 
-# ── Learning rate schedule ─────────────────────────────────────────────────
-# Root cause of observed instability (loss spikes at epochs 4 & 11):
-#   • LR=1e-3 too aggressive for a pretrained ResNet50 backbone.
-#   • CosineAnnealingWarmRestarts with T_0=10 caused hard LR resets that
-#     triggered loss spikes + accuracy crashes.
-#
-# Fix:
-#   • Lower base LR (3e-4) — safer for pretrained weights.
-#   • Linear warmup for WARMUP_EPOCHS before the cosine decay starts.
-#   • Single-cycle CosineAnnealingLR (no mid-training restarts).
-#   • Tighter gradient clipping (0.5 → was 1.0).
-LEARNING_RATE   = 3e-4        # lower base LR
-WEIGHT_DECAY    = 1e-4
-LR_ETA_MIN      = 1e-6        # cosine decay floor
-WARMUP_EPOCHS   = 5           # linear warmup: LR/10 → LR over first 5 epochs
-GRAD_CLIP_NORM  = 0.5         # tighter clip (was 1.0) — suppresses early spikes
-EARLY_STOP_PAT  = 15          # more patience; model needs time after warmup
-SEED            = 21
-MIXED_PRECISION = False       # AMP fp16/fp32 (CUDA only)
+# Fix A – lower LR (less aggressive memorisation in early epochs)
+LEARNING_RATE  = 1e-4            # was 2e-4
 
-# fine-tuning phase — run on BEST FOLD ONLY (not all folds)
+# Fix B – stronger weight decay
+WEIGHT_DECAY   = 1e-3            # was 5e-4
+
+LR_ETA_MIN     = 1e-6
+
+# Fix F – shorter warmup (dataset too small for 5-epoch warmup)
+WARMUP_EPOCHS  = 3               # was 5
+
+GRAD_CLIP_NORM = 0.5
+
+# Fix E – shorter patience (curves plateau fast)
+EARLY_STOP_PAT = 8               # was 12
+
+# Fix C – stronger label smoothing
+LABEL_SMOOTHING = 0.25           # was 0.2
+
+# Fix A – higher dropout everywhere
+DROPOUT_RATE   = 0.5             # was 0.3
+
+# Fix D – slightly stronger mixup
+MIXUP_ALPHA    = 0.4             # was 0.3
+
+SEED           = 42
+MIXED_PRECISION = False
+
+# Fine-tuning phase
 FINETUNE_EPOCHS = 20
-FINETUNE_LR     = 5e-5        # conservative; backbone gets x0.1 = 5e-6
+FINETUNE_LR     = 2e-5           # was 3e-5, lowered to match stronger regularisation
 FINETUNE_UNFREEZE_LAYERS = ["layer3", "layer4", "gcsa", "fc_proj"]

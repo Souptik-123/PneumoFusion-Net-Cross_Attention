@@ -23,6 +23,7 @@ train_fold  /  finetune_fold  /  export_vocab_scaler
 """
 
 import os, time, json, pickle, math
+import torch.nn.functional as F
 import numpy as np
 import torch
 import torch.nn as nn
@@ -36,6 +37,7 @@ from config import (
     DEVICE, CHECKPOINT_DIR, LOG_DIR,
     EPOCHS, LEARNING_RATE, WEIGHT_DECAY, LR_ETA_MIN,
     WARMUP_EPOCHS, GRAD_CLIP_NORM, EARLY_STOP_PAT,
+    LABEL_SMOOTHING, MIXUP_ALPHA,
     MIXED_PRECISION,
     FINETUNE_EPOCHS, FINETUNE_LR,
 )
@@ -90,6 +92,68 @@ def compute_metrics(y_true, y_pred, y_prob=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# MIXUP AUGMENTATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def mixup_batch(images, labels, num_classes, alpha=MIXUP_ALPHA):
+    """
+    Mixup data augmentation (Zhang et al., 2018).
+
+    Interpolates pairs of training samples and their one-hot labels:
+        x_mix = λ·x_i + (1-λ)·x_j
+        y_mix = λ·y_i + (1-λ)·y_j   (soft labels)
+
+    This directly addresses the overfitting observed at epoch 2:
+    the model can no longer memorise exact training samples because
+    every batch contains convex combinations it has never seen before.
+
+    Parameters
+    ----------
+    images     : (B, C, H, W) image tensor
+    labels     : (B,) integer class labels
+    num_classes: total number of classes
+    alpha      : Beta distribution parameter (0 = no mixup)
+
+    Returns
+    -------
+    mixed_images : (B, C, H, W)
+    mixed_labels : (B, num_classes) soft one-hot labels for use with
+                   F.cross_entropy(logits, mixed_labels) where mixed_labels
+                   is passed as a float tensor (not integer indices).
+    """
+    # Guard: catch label index OOB on CPU before it hits the CUDA scatter kernel
+    # (CUDA assertion aborts the process with no recoverable traceback on Windows)
+    assert labels.max().item() < num_classes, (
+        f"mixup_batch: label index {labels.max().item()} >= num_classes {num_classes}. "
+        f"Check label_map alignment with the dataset."
+    )
+    assert labels.min().item() >= 0, (
+        f"mixup_batch: negative label index {labels.min().item()} found."
+    )
+
+    if alpha <= 0:
+        # no mixup: return images + hard one-hot labels
+        one_hot = torch.zeros(labels.size(0), num_classes, device=labels.device)
+        one_hot.scatter_(1, labels.unsqueeze(1), 1.0)
+        return images, one_hot
+
+    lam = float(np.random.beta(alpha, alpha))
+    lam = max(lam, 1.0 - lam)           # always >= 0.5 so prediction is unambiguous
+
+    B   = images.size(0)
+    idx = torch.randperm(B, device=images.device)
+
+    mixed = lam * images + (1.0 - lam) * images[idx]
+
+    # soft one-hot labels
+    one_hot   = torch.zeros(B, num_classes, device=labels.device)
+    one_hot.scatter_(1, labels.unsqueeze(1), 1.0)
+    mixed_lbl = lam * one_hot + (1.0 - lam) * one_hot[idx]
+
+    return mixed, mixed_lbl
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # EARLY STOPPING
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -112,7 +176,7 @@ class EarlyStopping:
 # SINGLE EPOCH
 # ═══════════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, loader, criterion, optimizer, scaler, epoch):
+def train_one_epoch(model, loader, criterion, optimizer, scaler, epoch, num_classes):
     model.train()
     total_loss = 0.0
     all_labels, all_preds = [], []
@@ -124,19 +188,25 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, epoch):
         num_feats = num_feats.to(DEVICE, non_blocking=True)
         labels    = labels.to(DEVICE, non_blocking=True)
 
+        # ── Mixup augmentation ────────────────────────────────────────────
+        images, soft_labels = mixup_batch(images, labels, num_classes)
+
         optimizer.zero_grad(set_to_none=True)
 
         if MIXED_PRECISION and DEVICE.type == "cuda":
-            with autocast():
+            with torch.amp.autocast('cuda'):
                 logits = model(images, text_ids, num_feats)
-                loss   = criterion(logits, labels)
+                # soft-label cross-entropy: sum(soft_labels * log_softmax(logits))
+                log_probs = F.log_softmax(logits, dim=1)
+                loss = -(soft_labels * log_probs).sum(dim=1).mean()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             scaler.step(optimizer); scaler.update()
         else:
-            logits = model(images, text_ids, num_feats)
-            loss   = criterion(logits, labels)
+            logits    = model(images, text_ids, num_feats)
+            log_probs = F.log_softmax(logits, dim=1)
+            loss      = -(soft_labels * log_probs).sum(dim=1).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             optimizer.step()
@@ -169,7 +239,7 @@ def validate(model, loader, criterion):
         labels    = labels.to(DEVICE, non_blocking=True)
 
         if MIXED_PRECISION and DEVICE.type == "cuda":
-            with autocast():
+            with torch.amp.autocast('cuda'):
                 logits = model(images, text_ids, num_feats)
                 loss   = criterion(logits, labels)
         else:
@@ -192,14 +262,14 @@ def validate(model, loader, criterion):
 
 def train_fold(model, train_loader, val_loader, fold,
                epochs=EPOCHS, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
-               label_smoothing=0.1):
+               label_smoothing=LABEL_SMOOTHING):
     """Train one fold.  Returns best_metrics, history."""
     model.to(DEVICE)
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)  # not used directly with mixup
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = WarmupCosineScheduler(optimizer, WARMUP_EPOCHS, epochs, LR_ETA_MIN)
-    scaler    = GradScaler(enabled=(MIXED_PRECISION and DEVICE.type == "cuda"))
+    scaler    = torch.amp.GradScaler('cuda')
     es        = EarlyStopping(EARLY_STOP_PAT)
 
     best_val_loss = float("inf"); best_metrics = {}; history = []
@@ -211,7 +281,7 @@ def train_fold(model, train_loader, val_loader, fold,
     print(f"{'='*60}")
 
     for epoch in range(1, epochs + 1):
-        tr_loss, tr_m  = train_one_epoch(model, train_loader, criterion, optimizer, scaler, epoch)
+        tr_loss, tr_m  = train_one_epoch(model, train_loader, criterion, optimizer, scaler, epoch, model.cls_head.net[-1].out_features)
         val_loss, val_m = validate(model, val_loader, criterion)
         scheduler.step()
         cur_lr = optimizer.param_groups[0]["lr"]
@@ -270,14 +340,14 @@ def finetune_fold(model, train_loader, val_loader, fold,
     optimizer    = optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
     ft_warmup    = min(2, max(1, epochs // 10))
     scheduler    = WarmupCosineScheduler(optimizer, ft_warmup, epochs, LR_ETA_MIN)
-    scaler       = GradScaler(enabled=(MIXED_PRECISION and DEVICE.type == "cuda"))
+    scaler       = torch.amp.GradScaler('cuda')
     es           = EarlyStopping(patience=7)
 
     ckpt_path     = os.path.join(CHECKPOINT_DIR, f"fold{fold}_finetuned.pt")
     best_val_loss = float("inf"); best_metrics = {}; history = []
 
     for epoch in range(1, epochs + 1):
-        tr_loss, tr_m   = train_one_epoch(model, train_loader, criterion, optimizer, scaler, epoch)
+        tr_loss, tr_m   = train_one_epoch(model, train_loader, criterion, optimizer, scaler, epoch, model.cls_head.net[-1].out_features)
         val_loss, val_m = validate(model, val_loader, criterion)
         scheduler.step()
         cur_lr = optimizer.param_groups[-1]["lr"]

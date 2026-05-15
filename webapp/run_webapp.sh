@@ -31,7 +31,7 @@ echo "  PneumoFusion-Net Web Application"
 echo "============================================================"
 
 # ── Check checkpoint ──────────────────────────────────────────────────────
-CKPT="${CKPT_PATH:-outputs/checkpoints/fold0_finetuned.pt}"
+CKPT="${CKPT_PATH:-outputs/checkpoints/fold2_finetuned.pt}"
 if [ ! -f "$CKPT" ]; then
     echo ""
     echo "  WARNING: checkpoint not found at $CKPT"

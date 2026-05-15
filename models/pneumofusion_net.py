@@ -1,27 +1,12 @@
 """
 models/pneumofusion_net.py  –  Full PneumoFusion-Net
 
-Assembles all sub-modules into a single nn.Module:
-
-    CNNImageEncoder        (models/cnn_encoder.py)
-    BiLSTMTextEncoder      (models/text_encoder.py)
-    MLPNumericalEncoder    (models/numerical_encoder.py)
-    FeatureFusion          (models/fusion.py)           ← optional combined view
-    CrossAttentionTransformer  (models/transformer.py)
-    ClassificationHead     (models/classification_head.py)
-
-Forward signature
------------------
-    image     : (B, 1, H, W)
-    text_ids  : (B, MAX_SEQ_LEN)
-    num_feats : (B, NUM_NUMERICAL_FEATURES)
-    → logits  : (B, NUM_CLASSES)
-
-Fine-tuning helpers
--------------------
-    freeze_cnn_backbone()   – freeze ResNet50 stem/layer1/layer2
-    unfreeze_all()          – enable all gradients
-    get_parameter_groups()  – differential LRs for backbone vs head
+Changes vs previous version
+----------------------------
+• CrossAttentionTransformer now receives max_drop_path from config so
+  stochastic depth regularisation is active during training.
+• DROPOUT_RATE from config is now threaded into all sub-encoders so
+  the single config knob controls all dropout.
 """
 
 import torch
@@ -32,7 +17,8 @@ from config import (
     CNN_OUT_DIM, TEXT_OUT_DIM, NUM_OUT_DIM, FUSION_DIM,
     XATTN_LAYERS, XATTN_HEADS, XATTN_FF_DIM, XATTN_DROPOUT,
     CLS_HIDDEN_DIM, NUM_NUMERICAL_FEATURES,
-    IMAGE_SIZE, MAX_SEQ_LEN,
+    IMAGE_SIZE, MAX_SEQ_LEN, DROPOUT_RATE,
+    MAX_DROP_PATH,
 )
 from models.cnn_encoder        import CNNImageEncoder
 from models.text_encoder       import BiLSTMTextEncoder
@@ -52,23 +38,15 @@ class PneumoFusionNet(nn.Module):
     num_classes    : number of output classes
     vocab_size     : vocabulary size for the text encoder
     pretrained_cnn : load ImageNet-1K weights for ResNet50
-
-    Forward
-    -------
-    image     : (B, 1, H, W)              – grayscale CT image
-    text_ids  : (B, MAX_SEQ_LEN)          – tokenised clinical text
-    num_feats : (B, NUM_NUMERICAL_FEATURES) – standardised lab values
-
-    Returns
-    -------
-    logits : (B, num_classes)  – raw (pre-softmax) classification scores
+    dropout        : dropout rate applied throughout all sub-modules
     """
 
     def __init__(
         self,
-        num_classes:    int  = NUM_CLASSES,
-        vocab_size:     int  = VOCAB_SIZE,
-        pretrained_cnn: bool = True,
+        num_classes:    int   = NUM_CLASSES,
+        vocab_size:     int   = VOCAB_SIZE,
+        pretrained_cnn: bool  = True,
+        dropout:        float = DROPOUT_RATE,
     ):
         super().__init__()
 
@@ -77,34 +55,33 @@ class PneumoFusionNet(nn.Module):
             out_dim=CNN_OUT_DIM, pretrained=pretrained_cnn
         )
         self.text_encoder = BiLSTMTextEncoder(
-            vocab_size=vocab_size, out_dim=TEXT_OUT_DIM
+            vocab_size=vocab_size, out_dim=TEXT_OUT_DIM, dropout=dropout
         )
         self.num_encoder  = MLPNumericalEncoder(
-            in_dim=NUM_NUMERICAL_FEATURES, out_dim=NUM_OUT_DIM
+            in_dim=NUM_NUMERICAL_FEATURES, out_dim=NUM_OUT_DIM, dropout=dropout
         )
 
         # ── Per-modality projections → shared FUSION_DIM space ───────────
-        # These project each modality's feature vector into the shared
-        # dimension that the Cross-Attention Transformer operates in.
         self.cnn_proj  = nn.Linear(CNN_OUT_DIM,  FUSION_DIM)
         self.text_proj = nn.Linear(TEXT_OUT_DIM, FUSION_DIM)
         self.num_proj  = nn.Linear(NUM_OUT_DIM,  FUSION_DIM)
 
-        # ── Feature Fusion (combined representation, for reference) ───────
-        # Used to produce a single fused vector (not fed to transformer here,
-        # but available for auxiliary losses or future extensions).
+        # ── Feature Fusion (combined representation) ──────────────────────
         self.fusion = FeatureFusion(
             cnn_dim=CNN_OUT_DIM, text_dim=TEXT_OUT_DIM,
             num_dim=NUM_OUT_DIM, fusion_dim=FUSION_DIM,
+            dropout=dropout,
         )
 
         # ── Cross-Attention Transformer ───────────────────────────────────
+        # max_drop_path enables stochastic depth regularisation
         self.transformer = CrossAttentionTransformer(
             n_layers=XATTN_LAYERS,
             d_model=FUSION_DIM,
             n_heads=XATTN_HEADS,
             ff_dim=XATTN_FF_DIM,
             dropout=XATTN_DROPOUT,
+            max_drop_path=MAX_DROP_PATH,
         )
 
         # ── Classification Head ───────────────────────────────────────────
@@ -112,6 +89,7 @@ class PneumoFusionNet(nn.Module):
             d_model=FUSION_DIM,
             hidden_dim=CLS_HIDDEN_DIM,
             num_classes=num_classes,
+            dropout=dropout,
         )
 
     # ── Forward pass ─────────────────────────────────────────────────────
@@ -127,13 +105,13 @@ class PneumoFusionNet(nn.Module):
         text_feat = self.text_encoder(text_ids)    # (B, TEXT_OUT_DIM)
         num_feat  = self.num_encoder(num_feats)    # (B, NUM_OUT_DIM)
 
-        # 2. project each to FUSION_DIM (one token per modality)
+        # 2. project each to FUSION_DIM
         c = self.cnn_proj(cnn_feat)                # (B, FUSION_DIM)
         t = self.text_proj(text_feat)              # (B, FUSION_DIM)
         n = self.num_proj(num_feat)                # (B, FUSION_DIM)
 
-        # 3. cross-attention transformer
-        seq    = self.transformer(c, t, n)         # (B, 3, FUSION_DIM)
+        # 3. cross-attention transformer  → always (B, 3, FUSION_DIM)
+        seq    = self.transformer(c, t, n)
 
         # 4. classification head
         logits = self.cls_head(seq)                # (B, num_classes)
@@ -142,31 +120,13 @@ class PneumoFusionNet(nn.Module):
     # ── Fine-tuning helpers ───────────────────────────────────────────────
 
     def freeze_cnn_backbone(self):
-        """Freeze ResNet50 stem + layer1 + layer2; leave GCSA/DSC/head free."""
         self.cnn_encoder.freeze_backbone()
 
     def unfreeze_all(self):
-        """Un-freeze all parameters (call before fine-tuning)."""
         for p in self.parameters():
             p.requires_grad = True
 
-    def get_parameter_groups(
-        self,
-        lr_backbone: float = 1e-5,
-        lr_head:     float = 1e-3,
-    ):
-        """
-        Return two parameter groups with different learning rates for AdamW.
-
-        Groups
-        ------
-        backbone  : ResNet50 stem, layer1, layer2  → lr_backbone (lower)
-        head      : everything else                → lr_head     (higher)
-
-        Usage
-        -----
-        optimizer = AdamW(model.get_parameter_groups(1e-5, 1e-4), ...)
-        """
+    def get_parameter_groups(self, lr_backbone: float = 1e-5, lr_head: float = 1e-3):
         backbone_params, head_params = [], []
         for name, param in self.named_parameters():
             if "cnn_encoder.stem"   in name or \
@@ -198,7 +158,10 @@ if __name__ == "__main__":
         num_feat = torch.randn(B, NUM_NUMERICAL_FEATURES)
         out      = model(imgs, tok_ids, num_feat)
 
-    print(f"Output shape  : {out.shape}")           # (2, NUM_CLASSES)
+    print(f"Output shape  : {out.shape}")   # must be (2, NUM_CLASSES)
+    assert out.shape == (B, NUM_CLASSES), f"Shape error: {out.shape}"
+    print("Shape check passed ✓")
+
     total     = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total params  : {total:,}")

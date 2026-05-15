@@ -46,7 +46,7 @@ from config import (
 import os
 
 CKPT_PATH      = os.getenv("CKPT_PATH",
-                            str(PROJECT_ROOT / "outputs/checkpoints/fold0_finetuned.pt"))
+                            str(PROJECT_ROOT / "outputs/checkpoints/fold2_finetuned.pt"))
 TOKENIZER_PATH = os.getenv("TOKENIZER_PATH",
                             str(PROJECT_ROOT / "outputs/checkpoints/tokenizer.json"))
 SCALER_PATH    = os.getenv("SCALER_PATH",
@@ -184,135 +184,144 @@ def get_loader() -> ModelLoader:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GRAD-CAM EXTRACTOR  — FIXED
+# GRAD-CAM EXTRACTOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GradCAMExtractor:
     """
-    Gradient-weighted Class Activation Maps on cnn_encoder.layer4.
+    Gradient-weighted Class Activation Maps on cnn_encoder.layer4 (last conv block).
 
-    Fixes applied vs original:
-    1. _save_gradients stored grad_output[0] (shape: B,C,H,W) but generate()
-       then indexed [0] again, discarding all but the first channel-slice.
-       Fix: store the full grad_output[0] tensor and index batch dim in generate().
-    2. image_tensor.requires_grad_(True) was set but never used — gradients
-       flow through the registered hooks on layer4, not through the input.
-       Removed to avoid confusing autograd.
-    3. The extractor was instantiated AFTER a no_grad() forward pass, so
-       _features was always None on the very first run. Fixed by moving
-       the no_grad() prediction block into run_inference() only, and
-       letting run_gradcam() do a single grad-enabled forward here.
-    4. Added explicit check that hooks captured data before computing CAM.
+    Bug fixes vs original
+    ----------------------
+    1. cuDNN RNN backward error: PyTorch requires LSTM to be in TRAIN mode for
+       backward pass (cuDNN limitation). We temporarily set only the BiLSTM
+       submodule to train() during the backward step, then restore eval().
+       The rest of the model stays in eval() throughout.
+
+    2. Heatmap stuck at image border: was caused by detaching features in the
+       forward hook BEFORE gradients were computed. Fixed by storing the live
+       (non-detached) output tensor and only detaching AFTER backward().
+
+    3. Wrong layer: hooks now attach to the output of the GCSA module (after
+       layer4 + DSC + GCSA) rather than layer4 alone — this gives a richer,
+       spatially-aware activation map focused on diagnostically relevant regions.
     """
 
     def __init__(self, model: PneumoFusionNet):
         self.model      = model
-        self._features: Optional[torch.Tensor] = None
-        self._gradients: Optional[torch.Tensor] = None
+        self._features  = None   # stores live tensor (not detached yet)
+        self._gradients = None
 
-        # hook on the last ResNet stage
-        target_layer = model.cnn_encoder.layer4
+        # ── Hook on gcsa output — richer spatial map than raw layer4 ────────
+        # layer4 → dsc → gcsa  (gcsa already applies channel + spatial attention)
+        target_layer = model.cnn_encoder.gcsa
 
         self._fwd_hook = target_layer.register_forward_hook(self._save_features)
         self._bwd_hook = target_layer.register_full_backward_hook(self._save_gradients)
 
     def _save_features(self, module, input, output):
-        # output shape: (B, C, H, W) — detach so it won't hold the graph
-        self._features = output.detach()
+        # Store the LIVE output tensor (still in the computation graph).
+        # We detach only AFTER backward() so gradients can flow correctly.
+        self._features = output
 
     def _save_gradients(self, module, grad_input, grad_output):
-        # FIX 1: store grad_output[0] which is (B, C, H, W).
-        # Do NOT index the batch dim here — do it in generate().
-        self._gradients = grad_output[0].detach()
+        self._gradients = grad_output[0].detach().clone()
 
     def remove_hooks(self):
         self._fwd_hook.remove()
         self._bwd_hook.remove()
 
+    @staticmethod
+    def _set_bilstm_train(model: PneumoFusionNet):
+        """Set only the BiLSTM to train mode (required by cuDNN for backward)."""
+        model.text_encoder.bilstm.train()
+
+    @staticmethod
+    def _set_bilstm_eval(model: PneumoFusionNet):
+        model.text_encoder.bilstm.eval()
+
     def generate(
         self,
-        image_tensor: torch.Tensor,   # (1, C, H, W)
-        text_tensor:  torch.Tensor,   # (1, T)
-        num_tensor:   torch.Tensor,   # (1, F)
+        image_tensor: torch.Tensor,
+        text_tensor:  torch.Tensor,
+        num_tensor:   torch.Tensor,
         target_class: int,
         original_pil: Image.Image,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Returns
         -------
-        cam_norm    : (H, W) float32 in [0, 1]  — resized to original image size
-        heatmap_rgb : (H, W, 3) uint8  — JET colormap
-        overlay     : (H, W, 3) uint8  — blended with original image
+        cam_norm   : (H, W) float32 [0,1]  – raw Grad-CAM heatmap
+        heatmap_rgb: (H, W, 3) uint8       – coloured heatmap (COLORMAP_JET)
+        overlay    : (H, W, 3) uint8       – heatmap blended onto original image
         """
+        # ── Set model to eval; only BiLSTM needs train for cuDNN backward ────
         self.model.eval()
+        self._set_bilstm_train(self.model)
 
-        # FIX 2: no requires_grad_ on the image tensor — hooks capture
-        # gradients at layer4, independent of whether the input leaf
-        # has requires_grad set.
-        image_tensor = image_tensor.to(DEVICE)
-        text_tensor  = text_tensor.to(DEVICE)
-        num_tensor   = num_tensor.to(DEVICE)
+        # Fresh tensors — no leftover gradients from prior calls
+        img = image_tensor.detach().to(DEVICE).requires_grad_(True)
+        txt = text_tensor.detach().to(DEVICE)
+        num = num_tensor.detach().to(DEVICE)
 
-        self.model.zero_grad(set_to_none=True)
+        # ── Forward pass (with autograd active — NO torch.no_grad() here) ───
+        self.model.zero_grad()
+        logits = self.model(img, txt, num)
+        score  = logits[0, target_class]
 
-        # Enable grad for this scope
-        with torch.set_grad_enabled(True):
-            # Disable CuDNN for RNN backward compatibility
-            with torch.backends.cudnn.flags(enabled=False):
-                logits = self.model(image_tensor, text_tensor, num_tensor)
-                score  = logits[0, target_class]
-                score.backward()
+        # ── Backward pass ────────────────────────────────────────────────────
+        score.backward()
 
-        # ── sanity-check that hooks fired ─────────────────────────────────
+        # ── Restore full eval mode ────────────────────────────────────────────
+        self._set_bilstm_eval(self.model)
+
+        # ── Now safe to detach features ───────────────────────────────────────
         if self._features is None or self._gradients is None:
-            raise RuntimeError(
-                "Grad-CAM hooks did not capture data. "
-                "Ensure the model performs a forward pass through cnn_encoder.layer4."
-            )
+            raise RuntimeError("Grad-CAM hooks did not fire. Check layer attachment.")
 
-        # FIX 1 continued: index the batch dimension HERE, not inside the hook
-        # Both tensors are (B, C, H, W); we want sample 0 → (C, H, W)
-        features = self._features[0]    # (C, H, W)
-        grads    = self._gradients[0]   # (C, H, W)
+        features = self._features.detach()[0]     # (C, H', W')
+        grads    = self._gradients[0]             # (C, H', W')
 
-        # Global-average-pool gradients over spatial dims → channel weights
-        weights = grads.mean(dim=(1, 2))  # (C,)
+        # ── Compute Grad-CAM ─────────────────────────────────────────────────
+        # global average-pool gradients over spatial dims → importance weight per channel
+        weights = grads.mean(dim=[1, 2])                          # (C,)
+        cam     = (weights.view(-1, 1, 1) * features).sum(0)     # (H', W')
+        cam     = F.relu(cam)                                     # keep only positive
 
-        # Weighted sum of feature maps
-        cam = torch.sum(weights[:, None, None] * features, dim=0)  # (H, W)
-
-        # ReLU — keep only positive activations
-        cam = F.relu(cam)
-
-        # ── convert to numpy and normalise ────────────────────────────────
-        cam_np  = cam.cpu().numpy().astype(np.float32)
-        cam_min = cam_np.min()
-        cam_max = cam_np.max()
-
-        if (cam_max - cam_min) > 1e-8:
-            cam_np = (cam_np - cam_min) / (cam_max - cam_min)
+        # ── Normalise ────────────────────────────────────────────────────────
+        cam_np          = cam.cpu().float().numpy()
+        cam_min, cam_max = cam_np.min(), cam_np.max()
+        if cam_max - cam_min > 1e-8:
+            cam_norm = (cam_np - cam_min) / (cam_max - cam_min)
         else:
-            # Flat / dead CAM — return a neutral mid-value map
-            cam_np = np.full_like(cam_np, 0.5)
+            cam_norm = np.zeros_like(cam_np)
 
-        # ── resize to original image dimensions ───────────────────────────
-        # PIL .size → (width, height); cv2.resize dsize → (width, height) ✓
+        # ── Resize to original image dimensions ──────────────────────────────
         orig_w, orig_h = original_pil.size
-        cam_resized = cv2.resize(
-            cam_np,
+        cam_resized    = cv2.resize(
+            cam_norm.astype(np.float32),
             (orig_w, orig_h),
-            interpolation=cv2.INTER_LINEAR,
+            interpolation=cv2.INTER_CUBIC,
         )
+        # smooth with slight Gaussian blur for cleaner heatmap edges
+        cam_resized = cv2.GaussianBlur(cam_resized, (11, 11), sigmaX=4)
+        # re-normalise after blur
+        mn, mx = cam_resized.min(), cam_resized.max()
+        if mx - mn > 1e-8:
+            cam_resized = (cam_resized - mn) / (mx - mn)
 
-        # ── build heatmap and overlay ─────────────────────────────────────
+        # ── Colourmap → RGB heatmap ───────────────────────────────────────────
         heatmap_bgr = cv2.applyColorMap(
-            np.uint8(cam_resized * 255),
-            cv2.COLORMAP_JET,
+            (cam_resized * 255).astype(np.uint8), cv2.COLORMAP_JET
         )
         heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
 
-        orig_rgb = np.array(original_pil.convert("RGB"))
-        overlay  = cv2.addWeighted(orig_rgb, 0.6, heatmap_rgb, 0.4, 0)
+        # ── Overlay on original image ─────────────────────────────────────────
+        # Resize original to match, convert to RGB, blend
+        orig_rgb = np.array(
+            original_pil.convert("RGB").resize((orig_w, orig_h), Image.LANCZOS)
+        )
+        overlay = cv2.addWeighted(orig_rgb, 0.5, heatmap_rgb, 0.5, 0)
 
         return cam_resized.astype(np.float32), heatmap_rgb, overlay
 
@@ -369,30 +378,49 @@ def run_gradcam(
     target_class: Optional[int] = None,
 ) -> Tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Run inference then Grad-CAM.
+    Run inference + Grad-CAM.
 
-    FIX 3: The prediction-only forward pass now uses run_inference() which
-    is decorated with @torch.no_grad().  The GradCAMExtractor is created
-    AFTER that, so hooks are only active during the grad-enabled backward
-    pass and _features/_gradients are guaranteed to be populated.
+    IMPORTANT: this function must NOT be wrapped in @torch.no_grad() because
+    Grad-CAM requires a live computation graph for score.backward().
+    Prediction is obtained via a separate no_grad forward pass first.
+
+    Returns
+    -------
+    result     : prediction dict
+    cam_norm   : (H, W) raw normalised heatmap [0,1]
+    heatmap_rgb: (H, W, 3) uint8 coloured heatmap
+    overlay    : (H, W, 3) uint8 blended overlay
     """
     loader = get_loader()
 
-    img_t = preprocess_image(image)
-    txt_t = encode_text(clinical_text, loader.word2idx).to(DEVICE)
-    num_t = encode_numerics(numerical_row, loader.scaler)
+    img_t  = preprocess_image(image)
+    txt_t  = encode_text(clinical_text, loader.word2idx).to(DEVICE)
+    num_t  = encode_numerics(numerical_row, loader.scaler)
 
-    # ── Step 1: prediction only (no_grad, no hooks yet) ──────────────────
-    result = run_inference(image, clinical_text, numerical_row)
-    target = target_class if target_class is not None else result["class_index"]
+    # ── Pass 1: clean prediction with no_grad ────────────────────────────────
+    with torch.no_grad():
+        loader.model.eval()
+        logits = loader.model(img_t, txt_t, num_t)
+        probs  = F.softmax(logits, dim=1)[0].cpu().numpy()
+        idx    = int(np.argmax(probs))
 
-    # ── Step 2: Grad-CAM (hooks registered here, after prediction) ───────
+    result = {
+        "predicted_class": loader.idx2label[idx],
+        "confidence":      float(probs[idx]),
+        "probabilities":   {loader.idx2label[i]: float(p) for i, p in enumerate(probs)},
+        "class_index":     idx,
+    }
+
+    target = target_class if target_class is not None else idx
+
+    # ── Pass 2: Grad-CAM (requires autograd — no torch.no_grad wrapper) ──────
     extractor = GradCAMExtractor(loader.model)
     try:
         cam_norm, heatmap_rgb, overlay = extractor.generate(
-            img_t, txt_t, num_t, target, image,
+            img_t, txt_t, num_t, target, image
         )
     finally:
         extractor.remove_hooks()
+        loader.model.eval()   # ensure clean eval state after backward
 
     return result, cam_norm, heatmap_rgb, overlay
