@@ -43,7 +43,7 @@ from config import (
 )
 from data_pipeline import load_dataframe, get_fold_dataloaders, build_label_map
 from models import PneumoFusionNet
-from trainer     import train_fold, finetune_fold
+from trainer     import train_fold, finetune_fold, export_vocab_scaler
 from evaluate    import (
     evaluate_model, plot_confusion_matrix, plot_training_curves,
     aggregate_cv_results, save_fold_results, log_modality_weights,
@@ -205,42 +205,73 @@ def main():
                 os.path.join(CHECKPOINT_DIR, "best_fold_meta.pt"),
             )
 
-        # ── Fine-tuning ───────────────────────────────────────────────────
-        if not args.no_finetune:
-            print_banner(f"Fine-tuning – Fold {fold+1}")
-            ft_metrics, ft_history = finetune_fold(
-                model, train_loader, val_loader, fold,
-                epochs=FINETUNE_EPOCHS, lr=FINETUNE_LR,
-            )
+        # Fine-tuning is deferred: runs ONLY on the best fold after all
+        # folds complete.  See the section below the CV loop.
 
-            ft_ckpt_path = os.path.join(CHECKPOINT_DIR, f"fold{fold}_finetuned.pt")
-            ft_ckpt = torch.load(ft_ckpt_path, map_location=DEVICE)
-            model.load_state_dict(ft_ckpt["model_state"])
-
-            print_banner(f"Post-Fine-Tune Evaluation – Fold {fold+1}")
-            ft_eval_metrics, ft_y_true, ft_y_pred, _ = evaluate_model(
-                model, val_loader, class_names
-            )
-            cv_finetune_metrics.append(ft_eval_metrics)
-
-            plot_confusion_matrix(ft_y_true, ft_y_pred, fold, class_names, suffix="_finetuned")
-            plot_training_curves(ft_history, fold, suffix="_finetuned")
-            save_fold_results(ft_eval_metrics, fold, suffix="_finetuned")
-            log_modality_weights(model, fold, suffix="_finetuned")  # ← post fine-tune weights
-
-    # ── 5.  Aggregate results ──────────────────────────────────────────────
+    # ── 5.  Aggregate CV results ──────────────────────────────────────────
     if len(cv_metrics) > 1:
-        print_banner("Cross-Validation Aggregate (before fine-tuning)")
+        print_banner("Cross-Validation Aggregate")
         aggregate_cv_results(cv_metrics, label="CV_pretrain")
 
-        if cv_finetune_metrics:
-            print_banner("Cross-Validation Aggregate (after fine-tuning)")
-            aggregate_cv_results(cv_finetune_metrics, label="CV_finetuned")
+    # ── 6.  Fine-tune BEST FOLD ONLY ──────────────────────────────────────
+    if not args.no_finetune and len(folds_to_run) > 0:
+        print_banner(f"Fine-tuning BEST fold only: Fold {best_fold+1}  (F1={best_cv_f1*100:.2f}%)")
 
+        # reload the best-fold DataLoaders + vocab/scaler
+        train_loader_bf, val_loader_bf, vocab_bf, scaler_bf = get_fold_dataloaders(
+            df, best_fold, skf, label_map, batch_size=args.batch_size
+        )
+
+        # rebuild model and load best checkpoint
+        model_ft = PneumoFusionNet(
+            num_classes=num_classes,
+            vocab_size=len(vocab_bf),
+            pretrained_cnn=(not args.no_pretrain),
+        )
+        ckpt_bf = torch.load(
+            os.path.join(CHECKPOINT_DIR, f"fold{best_fold}_best.pt"),
+            map_location=DEVICE,
+        )
+        model_ft.load_state_dict(ckpt_bf["model_state"])
+
+        ft_metrics, ft_history = finetune_fold(
+            model_ft, train_loader_bf, val_loader_bf, best_fold,
+            epochs=FINETUNE_EPOCHS, lr=FINETUNE_LR,
+        )
+
+        # load best fine-tuned checkpoint for final evaluation
+        ft_ckpt = torch.load(
+            os.path.join(CHECKPOINT_DIR, f"fold{best_fold}_finetuned.pt"),
+            map_location=DEVICE,
+        )
+        model_ft.load_state_dict(ft_ckpt["model_state"])
+
+        print_banner(f"Post-Fine-Tune Evaluation – Fold {best_fold+1}")
+        ft_eval_metrics, ft_y_true, ft_y_pred, _ = evaluate_model(
+            model_ft, val_loader_bf, class_names
+        )
+
+        plot_confusion_matrix(ft_y_true, ft_y_pred, best_fold, class_names, suffix="_finetuned")
+        plot_training_curves(ft_history, best_fold, suffix="_finetuned")
+        save_fold_results(ft_eval_metrics, best_fold, suffix="_finetuned")
+        log_modality_weights(model_ft, best_fold, suffix="_finetuned")
+
+        # ── Export tokenizer.json + scaler.pkl from best fold ─────────────
+        print_banner("Exporting tokenizer + scaler (best fold)")
+        export_vocab_scaler(vocab_bf, scaler_bf, label_map, best_fold)
+
+        cv_finetune_metrics.append(ft_eval_metrics)
+    elif not args.no_finetune:
+        # single-fold run: export from that fold's vocab/scaler
+        # (vocab/scaler already saved via best_fold_meta.pt above)
+        pass
+
+    # ── 7.  Final summary ─────────────────────────────────────────────────
     print_banner("DONE")
     print(f"  Best fold     : {best_fold+1}  (F1={best_cv_f1*100:.2f}%)")
     print(f"  Checkpoints   : {CHECKPOINT_DIR}")
     print(f"  Results/plots : {RESULTS_DIR}")
+    print(f"  Artefacts     : tokenizer.json / scaler.pkl / label_map.json")
     print(f"  Logs          : {os.path.join(os.path.dirname(CHECKPOINT_DIR), 'logs')}")
 
 

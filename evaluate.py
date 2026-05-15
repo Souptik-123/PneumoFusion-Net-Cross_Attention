@@ -22,7 +22,7 @@ import seaborn as sns
 from sklearn.metrics import (
     confusion_matrix, classification_report,
     accuracy_score, f1_score, precision_score,
-    recall_score, roc_auc_score,
+    recall_score, roc_auc_score, multilabel_confusion_matrix,
 )
 
 from config import DEVICE, RESULTS_DIR, CLASS_NAMES, MIXED_PRECISION
@@ -70,10 +70,10 @@ def evaluate_model(model, loader, label_names=CLASS_NAMES):
 
     # ── metrics ───────────────────────────────────────────────────────────
     metrics = {
-        "accuracy":  float(accuracy_score(y_true, y_pred)),
-        "precision": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
-        "recall":    float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
-        "f1_macro":  float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "accuracy":    float(accuracy_score(y_true, y_pred)),
+        "precision":   float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
+        "recall":      float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+        "f1_macro":    float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
         "f1_weighted": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
     }
     try:
@@ -83,18 +83,36 @@ def evaluate_model(model, loader, label_names=CLASS_NAMES):
     except ValueError:
         pass
 
-    # per-class F1
+    # ── per-class specificity = TN / (TN + FP)  ───────────────────────────
+    # multilabel_confusion_matrix gives a (C, 2, 2) array; for class i:
+    #   mcm[i] = [[TN, FP], [FN, TP]]
+    mcm         = multilabel_confusion_matrix(y_true, y_pred)
+    specificities = []
+    for i, name in enumerate(label_names):
+        tn = float(mcm[i][0, 0])
+        fp = float(mcm[i][0, 1])
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        specificities.append(spec)
+        metrics[f"specificity_{name.replace(' ', '_')}"] = spec
+    metrics["specificity_macro"] = float(np.mean(specificities))
+
+    # ── per-class F1 ─────────────────────────────────────────────────────
     per_class_f1 = f1_score(y_true, y_pred, average=None, zero_division=0)
     for i, name in enumerate(label_names):
         metrics[f"f1_{name.replace(' ', '_')}"] = float(per_class_f1[i])
 
     print("\n" + "─" * 55)
-    print(f"  Accuracy  : {metrics['accuracy']*100:.2f}%")
-    print(f"  Precision : {metrics['precision']*100:.2f}%")
-    print(f"  Recall    : {metrics['recall']*100:.2f}%")
-    print(f"  F1 Macro  : {metrics['f1_macro']*100:.2f}%")
+    print(f"  Accuracy         : {metrics['accuracy']*100:.2f}%")
+    print(f"  Precision        : {metrics['precision']*100:.2f}%")
+    print(f"  Recall           : {metrics['recall']*100:.2f}%")
+    print(f"  Specificity      : {metrics['specificity_macro']*100:.2f}%")
+    print(f"  F1 Macro         : {metrics['f1_macro']*100:.2f}%")
     if "roc_auc" in metrics:
-        print(f"  ROC-AUC   : {metrics['roc_auc']:.4f}")
+        print(f"  ROC-AUC          : {metrics['roc_auc']:.4f}")
+    print("  Per-class specificity:")
+    for name in label_names:
+        key = f"specificity_{name.replace(' ', '_')}"
+        print(f"    {name:25s}: {metrics[key]*100:.2f}%")
     print("─" * 55)
     print(classification_report(y_true, y_pred, target_names=label_names, digits=4))
 
@@ -180,7 +198,7 @@ def aggregate_cv_results(fold_metrics: list, label: str = "Cross-Validation"):
 
     Prints mean ± std for key metrics and saves a summary JSON.
     """
-    keys = ["accuracy", "f1_macro", "precision", "recall"]
+    keys = ["accuracy", "f1_macro", "precision", "recall", "specificity_macro"]
     print(f"\n{'═'*55}")
     print(f"  {label} Summary  ({len(fold_metrics)} folds)")
     print(f"{'═'*55}")
@@ -248,7 +266,9 @@ def log_modality_weights(model, fold: int, suffix: str = ""):
     print(f"  {'─'*52}")
     for name, w in weights.items():
         pct     = w * 100
-        print(f"    {name:20s} :  {pct:5.2f} % ")
+        bar_len = int(round(pct / max_pct * bar_max))
+        bar     = "█" * bar_len
+        print(f"    {name:20s} :  {pct:5.2f} %   {bar}")
     print(f"  {'─'*52}")
     print(f"  (weights sum to {sum(weights.values())*100:.1f} %)")
 

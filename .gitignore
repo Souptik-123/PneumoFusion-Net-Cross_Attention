@@ -1,6 +1,7 @@
 projectvenv/
 __pycache__/
 images/
-outputs/checkpoints/
+outputs/
 *.pt
 *.pth
+*.pkl

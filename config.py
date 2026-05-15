@@ -11,7 +11,7 @@ import torch
 # PATHS  (edit DATA_ROOT to where your images live)
 # ─────────────────────────────────────────────
 DATA_ROOT   = "."          # folder that contains the "images/" subdirectory
-CSV_PATH    = "unified_dataset_new.csv"
+CSV_PATH    = "unified_dataset_new1.csv"
 OUTPUT_DIR  = "outputs"
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
 LOG_DIR        = os.path.join(OUTPUT_DIR, "logs")
@@ -29,11 +29,11 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # DATA
 # ─────────────────────────────────────────────
 IMAGE_SIZE    = 224          # resize both H and W to this
-NUM_CLASSES   = 5           # Bacterial, Covid-19, Normal, Tuberculosis, Viral  → set 5 if Covid present
+           # Bacterial, Covid-19, Normal, Tuberculosis, Viral  → set 5 if Covid present
 #CLASS_NAMES   = ["Bacterial Pneumonia", "Normal", "Tuberculosis", "Viral Pneumonia"]
 # If your CSV also has Covid-19:
 CLASS_NAMES = ["Bacterial Pneumonia", "Corona Virus Disease", "Normal", "Tuberculosis", "Viral Pneumonia"]
-# NUM_CLASSES = 5
+NUM_CLASSES = 5
 
 NUM_WORKERS   = 4
 
@@ -80,7 +80,7 @@ FUSION_DIM = 256         # unified projection dim D fed into the transformer
 XATTN_HEADS      = 8
 XATTN_FF_DIM     = 512
 XATTN_LAYERS     = 2
-XATTN_DROPOUT    = 0.1
+XATTN_DROPOUT    = 0.3
 
 # --- Classification head ---
 CLS_HIDDEN_DIM  = 128
@@ -91,15 +91,28 @@ CLS_HIDDEN_DIM  = 128
 K_FOLDS        = 5
 EPOCHS         = 80
 BATCH_SIZE     = 32
-LEARNING_RATE  = 1e-3
-WEIGHT_DECAY   = 1e-4
-LR_T0          = 10     # CosineAnnealingWarmRestarts T_0
-LR_ETA_MIN     = 1e-6
-EARLY_STOP_PAT = 10      # patience epochs
-SEED           = 42
-MIXED_PRECISION = False   # AMP  (fp16/fp32)
 
-# fine-tuning phase (run after full training on best fold)
+# ── Learning rate schedule ─────────────────────────────────────────────────
+# Root cause of observed instability (loss spikes at epochs 4 & 11):
+#   • LR=1e-3 too aggressive for a pretrained ResNet50 backbone.
+#   • CosineAnnealingWarmRestarts with T_0=10 caused hard LR resets that
+#     triggered loss spikes + accuracy crashes.
+#
+# Fix:
+#   • Lower base LR (3e-4) — safer for pretrained weights.
+#   • Linear warmup for WARMUP_EPOCHS before the cosine decay starts.
+#   • Single-cycle CosineAnnealingLR (no mid-training restarts).
+#   • Tighter gradient clipping (0.5 → was 1.0).
+LEARNING_RATE   = 3e-4        # lower base LR
+WEIGHT_DECAY    = 1e-4
+LR_ETA_MIN      = 1e-6        # cosine decay floor
+WARMUP_EPOCHS   = 5           # linear warmup: LR/10 → LR over first 5 epochs
+GRAD_CLIP_NORM  = 0.5         # tighter clip (was 1.0) — suppresses early spikes
+EARLY_STOP_PAT  = 15          # more patience; model needs time after warmup
+SEED            = 21
+MIXED_PRECISION = False       # AMP fp16/fp32 (CUDA only)
+
+# fine-tuning phase — run on BEST FOLD ONLY (not all folds)
 FINETUNE_EPOCHS = 20
-FINETUNE_LR     = 1e-4
+FINETUNE_LR     = 5e-5        # conservative; backbone gets x0.1 = 5e-6
 FINETUNE_UNFREEZE_LAYERS = ["layer3", "layer4", "gcsa", "fc_proj"]

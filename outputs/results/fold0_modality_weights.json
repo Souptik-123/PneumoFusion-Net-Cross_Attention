@@ -2,8 +2,8 @@
   "fold": 0,
   "suffix": "",
   "weights": {
-    "CT image (CNN)": 0.3395,
-    "Clinical text": 0.3275,
-    "Lab numerics": 0.333
+    "CT image (CNN)": 0.3328,
+    "Clinical text": 0.3368,
+    "Lab numerics": 0.3304
   }
 }
