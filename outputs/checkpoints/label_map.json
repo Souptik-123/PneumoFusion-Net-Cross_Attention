@@ -1,0 +1,7 @@
+{
+  "Bacterial Pneumonia": 0,
+  "Corona Virus Disease": 1,
+  "Normal": 2,
+  "Tuberculosis": 3,
+  "Viral Pneumonia": 4
+}

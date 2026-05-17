@@ -2,6 +2,29 @@
 models/classification_head.py  –  Classification Head
                                    with Learnable Modality Weights
 
+DATA-LEAKAGE FIX
+================
+FIX 3 — token_weights initialised with paper-derived non-uniform priors [MEDIUM]
+---------------------------------------------------------------------------------
+Previous bug: token_weights was initialised as:
+    nn.Parameter(torch.tensor([0.45, 0.22, 0.33], dtype=torch.float32))
+
+These values came directly from the paper's Figure 5A result
+(CT ≈ 45%, Lab ≈ 33%, Text ≈ 22%).  Baking them in as the starting
+point means:
+  1. The model begins training with an implicit prior injected from
+     prior-knowledge / held-out results, not from the data itself.
+  2. If the class balance or modality contributions differ in YOUR
+     dataset, the biased init slows convergence or produces a local
+     minimum close to the paper's regime rather than the data's truth.
+  3. It constitutes a subtle form of information leakage from the
+     paper's test set into the model's parameter initialisation.
+
+Fix: token_weights initialised to ones (→ uniform softmax = 0.333 each).
+The model now learns the contribution ratio entirely from the training
+data, with no external prior baked in.  This is the standard approach
+and adds only 3 scalar parameters of overhead.
+
 Architecture
 ------------
 transformer_output  (B, 3, D)  – three modality tokens [CNN | Text | Numerical]
@@ -11,35 +34,6 @@ transformer_output  (B, 3, D)  – three modality tokens [CNN | Text | Numerical
   → LayerNorm + ReLU + Dropout
   → Linear(hidden_dim → num_classes)
   → raw logits  (B, num_classes)
-
-Why learnable weights instead of mean-pool
-------------------------------------------
-The paper (Figure 5A) reports that the three modalities contribute
-unequally to the final decision:
-    CT image        ≈ 45 %
-    Lab numerics    ≈ 33 %
-    Clinical text   ≈ 12 %
-    Radiology report≈ 10 %  (folded into text token in our 3-modality code)
-
-A plain mean-pool forces each modality to contribute exactly 33.3 %,
-ignoring this imbalance.
-
-Option B – learnable token weights
-    self.token_weights = nn.Parameter(torch.ones(3))   # initialised equal
-    w = softmax(token_weights)                         # always sums to 1
-    pooled = (seq * w).sum(dim=1)                      # weighted sum
-
-Benefits
---------
-• The model learns the contribution ratio from *this* dataset during
-  training – it will naturally converge towards something close to the
-  paper's 45/33/12 split if the data supports it.
-• Weights are inspectable after training:
-      w = torch.softmax(model.cls_head.token_weights, dim=0)
-      # → tensor([0.45, 0.12, 0.33])  (CNN, Text, Numerical)
-• Initialised as equal (ones → softmax → 0.333 each) so training starts
-  from the same unbiased point as mean-pool.
-• Adds only 3 scalar parameters – negligible cost.
 
 Token order convention (matches transformer.py output)
 -------------------------------------------------------
@@ -54,7 +48,6 @@ import torch.nn.functional as F
 
 from config import FUSION_DIM, CLS_HIDDEN_DIM, NUM_CLASSES
 
-# Human-readable names for the 3 token positions – used in get_modality_weights()
 MODALITY_NAMES = ["CT image (CNN)", "Clinical text", "Lab numerics"]
 
 
@@ -73,7 +66,8 @@ class ClassificationHead(nn.Module):
     ----------
     token_weights : nn.Parameter  shape (3,)
         Raw (pre-softmax) scalar importance score for each modality token.
-        Inspectable via  self.get_modality_weights()  after training.
+        Initialised to ones → uniform 0.333 each.
+        Inspectable via self.get_modality_weights() after training.
 
     Forward
     -------
@@ -89,13 +83,12 @@ class ClassificationHead(nn.Module):
     ):
         super().__init__()
 
-        # ── Learnable modality importance weights ─────────────────────────
-        # Initialised to ones so softmax starts at uniform (0.333, 0.333, 0.333).
-        # During training the model will push these towards the true importance
-        # ratio (e.g. CNN > Numerical > Text for pneumonia classification).
-        self.token_weights = nn.Parameter(torch.tensor([0.45, 0.22, 0.33], dtype=torch.float32))
+        # FIX 3: initialised to ones (uniform) — no paper-derived prior baked in.
+        # After training, these will naturally converge toward the true
+        # contribution ratio for this dataset.
+        self.token_weights = nn.Parameter(torch.ones(3, dtype=torch.float32))
 
-        # ── Classification MLP ────────────────────────────────────────────
+        # Classification MLP
         self.net = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -116,15 +109,12 @@ class ClassificationHead(nn.Module):
         logits : (B, num_classes)  – raw (pre-softmax) classification scores
         """
         # softmax over the 3 raw scalars → weights that sum to 1
-        # shape: (3,) → broadcast to (1, 3, 1) for element-wise multiply
         w = F.softmax(self.token_weights, dim=0).view(1, 3, 1)   # (1, 3, 1)
 
         # weighted sum across the token dimension
         pooled = (seq * w).sum(dim=1)                             # (B, d_model)
 
         return self.net(pooled)                                   # (B, num_classes)
-
-    # ── Inspection helper ─────────────────────────────────────────────────
 
     def get_modality_weights(self) -> dict:
         """
@@ -133,7 +123,7 @@ class ClassificationHead(nn.Module):
         Usage (after training)
         ----------------------
             weights = model.cls_head.get_modality_weights()
-            # {'CT image (CNN)': 0.45, 'Clinical text': 0.12, 'Lab numerics': 0.43}
+            # e.g. {'CT image (CNN)': 0.45, 'Clinical text': 0.12, 'Lab numerics': 0.43}
 
         Returns
         -------

@@ -1,0 +1,9 @@
+{
+  "fold": 3,
+  "suffix": "",
+  "weights": {
+    "CT image (CNN)": 0.3361,
+    "Clinical text": 0.3343,
+    "Lab numerics": 0.3295
+  }
+}

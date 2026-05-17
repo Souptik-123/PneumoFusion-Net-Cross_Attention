@@ -7,8 +7,9 @@ Endpoints
 ---------
 GET  /health          – liveness check
 POST /predict         – multimodal inference (JSON response)
-POST /gradcam         – inference + Grad-CAM (returns prediction + image URLs)
-POST /report          – full pipeline: predict + Grad-CAM + AI report (JSON)
+POST /gradcam         – inference + Grad-CAM++ (returns prediction + image URLs)
+POST /report          – full pipeline: predict + Grad-CAM++ + AI report (JSON)
+POST /explain         – Grad-CAM++ + SHAP fused explainability (NEW)
 GET  /classes         – list of class names
 GET  /reference_ranges – lab reference ranges for frontend display
 
@@ -30,9 +31,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import cv2
 
-# local imports
 from webapp.backend.inference_engine import (
-    get_loader, run_inference, run_gradcam,
+    get_loader, run_inference, run_gradcam, run_fused_explain,
     encode_text, encode_numerics, preprocess_image,
 )
 from webapp.backend.report_generator import generate_report, LAB_REFERENCE
@@ -45,7 +45,7 @@ from webapp.backend.report_generator import generate_report, LAB_REFERENCE
 app = FastAPI(
     title="PneumoFusion-Net API",
     description="Multimodal AI pneumonia diagnosis backend",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -58,7 +58,7 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STARTUP: load model once
+# STARTUP
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -105,7 +105,7 @@ def _numerical_from_form(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES
+# ROUTES – system
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["System"])
@@ -130,7 +130,9 @@ def reference_ranges():
     return {"reference_ranges": LAB_REFERENCE}
 
 
-# ── PREDICTION ONLY ────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTES – inference
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/predict", tags=["Inference"])
 async def predict(
@@ -145,12 +147,10 @@ async def predict(
     crp:              float      = Form(...),
     pct:              float      = Form(...),
 ):
-    """
-    Run multimodal inference.  Returns predicted class + probabilities.
-    """
+    """Run multimodal inference. Returns predicted class + probabilities."""
     t0 = time.perf_counter()
     try:
-        image = _pil_from_upload(ct_image)
+        image   = _pil_from_upload(ct_image)
         num_row = _numerical_from_form(age, sex, wbc, neut, lymp, nlr, crp, pct)
         result  = run_inference(image, clinical_text, num_row)
         result["inference_ms"] = round((time.perf_counter() - t0) * 1000, 1)
@@ -158,8 +158,6 @@ async def predict(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference failed: {e}")
 
-
-# ── GRAD-CAM ───────────────────────────────────────────────────────────────
 
 @app.post("/gradcam", tags=["Inference"])
 async def gradcam(
@@ -176,20 +174,19 @@ async def gradcam(
     target_class:     Optional[int] = Form(None),
 ):
     """
-    Run inference + Grad-CAM.
+    Run inference + Grad-CAM++.
     Returns prediction dict + base64-encoded PNG images:
         original_b64, heatmap_b64, overlay_b64
     """
     t0 = time.perf_counter()
     try:
-        pil_img  = _pil_from_upload(ct_image)
-        num_row  = _numerical_from_form(age, sex, wbc, neut, lymp, nlr, crp, pct)
+        pil_img = _pil_from_upload(ct_image)
+        num_row = _numerical_from_form(age, sex, wbc, neut, lymp, nlr, crp, pct)
 
         result, cam_norm, heatmap_rgb, overlay = run_gradcam(
             pil_img, clinical_text, num_row, target_class
         )
 
-        # encode original image as RGB
         orig_rgb = np.array(pil_img.convert("RGB"))
 
         response = {
@@ -205,7 +202,83 @@ async def gradcam(
         raise HTTPException(status_code=500, detail=f"Grad-CAM failed: {e}")
 
 
-# ── FULL REPORT ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTE – fused Grad-CAM++ + SHAP explainability  (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/explain", tags=["Explainability"])
+async def explain(
+    ct_image:         UploadFile      = File(...),
+    clinical_text:    str             = Form(""),
+    age:              float           = Form(...),
+    sex:              str             = Form(...),
+    wbc:              float           = Form(...),
+    neut:             float           = Form(...),
+    lymp:             float           = Form(...),
+    nlr:              float           = Form(...),
+    crp:              float           = Form(...),
+    pct:              float           = Form(...),
+    target_class:     Optional[int]   = Form(None),
+):
+    """
+    Full explainability pipeline:
+
+    1. Grad-CAM++ on the GCSA layer  →  heatmap / overlay
+    2. SHAP DeepExplainer on numerics →  per-feature importance values
+    3. Re-weight Grad-CAM++ heatmap   →  fused overlay
+
+    Response fields
+    ---------------
+    predicted_class, confidence, probabilities, class_index
+    original_b64          base64 PNG  – original CT
+    heatmap_b64           base64 PNG  – raw Grad-CAM++ heatmap (INFERNO)
+    overlay_b64           base64 PNG  – unweighted Grad-CAM++ overlay
+    heatmap_fused_b64     base64 PNG  – SHAP-weighted Grad-CAM++ heatmap
+    overlay_fused_b64     base64 PNG  – SHAP-weighted overlay (main output)
+    shap_values           list[float] – SHAP attribution per numerical feature
+    feature_labels        list[str]
+    image_weight          float       – fraction of prediction from CT image
+    shap_text             str         – human-readable narrative
+    inference_ms          float
+    """
+    t0 = time.perf_counter()
+    try:
+        pil_img = _pil_from_upload(ct_image)
+        num_row = _numerical_from_form(age, sex, wbc, neut, lymp, nlr, crp, pct)
+
+        expl = run_fused_explain(pil_img, clinical_text, num_row, target_class)
+
+        orig_rgb = np.array(pil_img.convert("RGB"))
+
+        return {
+            # prediction
+            "predicted_class":  expl["predicted_class"],
+            "confidence":       expl["confidence"],
+            "probabilities":    expl["probabilities"],
+            "class_index":      expl["class_index"],
+            # images (base64 PNG)
+            "original_b64":         _ndarray_to_b64(orig_rgb),
+            "heatmap_b64":          _ndarray_to_b64(expl["heatmap_rgb"]),
+            "overlay_b64":          _ndarray_to_b64(expl["overlay"]),
+            "heatmap_fused_b64":    _ndarray_to_b64(expl["heatmap_rgb_fused"]),
+            "overlay_fused_b64":    _ndarray_to_b64(expl["overlay_fused"]),
+            # SHAP
+            "shap_values":    expl["shap_values"],
+            "feature_labels": expl["feature_labels"],
+            "image_weight":   expl["image_weight"],
+            "shap_text":      expl["shap_text"],
+            # timing
+            "inference_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Explainability failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTE – full report  (unchanged, now uses Grad-CAM++ internally)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/report", tags=["Report"])
 async def full_report(
@@ -222,14 +295,13 @@ async def full_report(
     openai_key:       str        = Form("", description="Optional OpenAI API key override"),
 ):
     """
-    Full pipeline: multimodal inference + Grad-CAM + AI report.
+    Full pipeline: multimodal inference + Grad-CAM++ + AI report.
 
     Returns everything the frontend needs:
         prediction, probabilities, all 3 images (b64), AI report sections.
     """
     t0 = time.perf_counter()
     try:
-        # ── allow per-request API key override ────────────────────────────
         if openai_key:
             import os
             os.environ["OPENAI_API_KEY"] = openai_key
@@ -237,27 +309,23 @@ async def full_report(
         pil_img = _pil_from_upload(ct_image)
         num_row = _numerical_from_form(age, sex, wbc, neut, lymp, nlr, crp, pct)
 
-        # ── inference + Grad-CAM ─────────────────────────────────────────
         result, cam_norm, heatmap_rgb, overlay = run_gradcam(
             pil_img, clinical_text, num_row
         )
 
-        orig_rgb     = np.array(pil_img.convert("RGB"))
-        orig_b64     = _ndarray_to_b64(orig_rgb)
-        heatmap_b64  = _ndarray_to_b64(heatmap_rgb)
-        overlay_b64  = _ndarray_to_b64(overlay)
+        orig_rgb    = np.array(pil_img.convert("RGB"))
+        orig_b64    = _ndarray_to_b64(orig_rgb)
+        heatmap_b64 = _ndarray_to_b64(heatmap_rgb)
+        overlay_b64 = _ndarray_to_b64(overlay)
 
-        # ── Grad-CAM textual summary for the prompt ───────────────────────
-        # Use the 10% brightest CAM region to describe intensity
         cam_thresh = np.percentile(cam_norm, 90)
         intensity  = "high" if cam_thresh > 0.7 else ("moderate" if cam_thresh > 0.4 else "low")
         gradcam_txt = (
-            f"Grad-CAM heatmap shows {intensity}-intensity activation "
+            f"Grad-CAM++ heatmap (INFERNO colormap) shows {intensity}-intensity activation "
             f"in lung regions, highlighting areas most influential for the prediction of "
             f"{result['predicted_class']}."
         )
 
-        # ── AI report ────────────────────────────────────────────────────
         report = generate_report(
             predicted_class  = result["predicted_class"],
             confidence       = result["confidence"],
@@ -268,18 +336,14 @@ async def full_report(
         )
 
         return {
-            # prediction
             "predicted_class":  result["predicted_class"],
             "confidence":       result["confidence"],
             "probabilities":    result["probabilities"],
             "class_index":      result["class_index"],
-            # images
             "original_b64":     orig_b64,
             "heatmap_b64":      heatmap_b64,
             "overlay_b64":      overlay_b64,
-            # AI report sections
             "report":           report,
-            # timing
             "total_ms":         round((time.perf_counter() - t0) * 1000, 1),
         }
 

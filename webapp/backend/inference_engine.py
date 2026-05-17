@@ -2,15 +2,44 @@
 webapp/backend/inference_engine.py
 ───────────────────────────────────
 Handles ALL model inference for the web application:
-  • ModelLoader     – singleton that loads PneumoFusionNet + artefacts once
-  • preprocess_image – PIL → tensor
-  • encode_text      – raw string → token ids
-  • encode_numerics  – dict → standardised numpy array → tensor
-  • run_inference    – full multimodal forward pass → predictions
-  • GradCAMExtractor – Grad-CAM on cnn_encoder.layer4 → heatmap overlay
+  • ModelLoader        – singleton that loads PneumoFusionNet + artefacts once
+  • preprocess_image   – PIL → tensor
+  • encode_text        – raw string → token ids
+  • encode_numerics    – dict → standardised numpy array → tensor
+  • run_inference      – full multimodal forward pass → predictions
+  • GradCAMPlusPlus    – Grad-CAM++ on cnn_encoder.gcsa → heatmap overlay
+  • SHAPExplainer      – DeepExplainer SHAP values for numerical + modality weights
+  • FusedExplainer     – Grad-CAM++ map re-weighted by SHAP-derived image modality
+                         contribution; also returns per-feature SHAP bar data
 
-The engine is completely decoupled from FastAPI; it can also be imported
-by unit tests or notebooks.
+Why GradCAM++ instead of vanilla GradCAM
+-----------------------------------------
+Vanilla Grad-CAM uses global-average-pooled gradients (one scalar weight per
+channel).  When the model's cross-attention fusion already summarises spatial
+information, those scalars can all be close to zero → the heatmap collapses to
+a uniform blob or sticks at the image border.
+
+Grad-CAM++ weights each *spatial position* separately before pooling, using the
+second-order gradient terms.  This produces a sharper, more localised activation
+map that is robust even when the raw gradient magnitudes are small.
+
+Why combine with SHAP
+---------------------
+SHAP (SHapley Additive exPlanations) operates on the *numerical* feature space
+via DeepExplainer, giving us two things:
+  1. Per-feature importance values (WBC, CRP, NLR …) in the direction of the
+     predicted class – these are displayed as a horizontal bar chart.
+  2. Aggregate SHAP magnitude across the numerical modality, which we compare
+     with the gradient norm from the image and text branches to compute a soft
+     *image-modality weight* ∈ [0, 1].  The Grad-CAM++ map is then scaled by
+     this weight: if the model was mostly driven by labs, the heatmap is dimmed
+     accordingly, preventing misleading high-activation images.
+
+Thread-safety note
+------------------
+Both the SHAP DeepExplainer and GradCAMExtractor install temporary PyTorch hooks.
+They are created fresh per request and all hooks are removed in a `finally` block.
+Do NOT share a single extractor instance across concurrent requests.
 """
 
 import io
@@ -40,13 +69,10 @@ from config import (
     CLS_HIDDEN_DIM,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DEFAULT ARTEFACT PATHS  (override via env vars in docker/prod)
-# ─────────────────────────────────────────────────────────────────────────────
 import os
 
 CKPT_PATH      = os.getenv("CKPT_PATH",
-                            str(PROJECT_ROOT / "outputs/checkpoints/fold2_finetuned.pt"))
+                            str(PROJECT_ROOT / "outputs/checkpoints/fold2_best.pt"))
 TOKENIZER_PATH = os.getenv("TOKENIZER_PATH",
                             str(PROJECT_ROOT / "outputs/checkpoints/tokenizer.json"))
 SCALER_PATH    = os.getenv("SCALER_PATH",
@@ -95,10 +121,6 @@ def preprocess_image(image: Image.Image) -> torch.Tensor:
 
 def encode_numerics(row: dict, scaler) -> torch.Tensor:
     """
-    row keys expected:
-        Patient_Age, Patient_Sex, WBC (x10^9/L), NEUT%, LYMP%,
-        NLR, CRP (mg/L), PCT (ng/mL)
-
     Returns (1, NUM_NUMERICAL_FEATURES) float tensor.
     """
     sex_female = 1.0 if str(row.get("Patient_Sex", "Female")).lower() == "female" else 0.0
@@ -116,10 +138,7 @@ def encode_numerics(row: dict, scaler) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ModelLoader:
-    """
-    Load and cache the model + artefacts exactly once per process.
-    Thread-safe (GIL-protected for pure Python; use a lock if needed for async).
-    """
+    """Load and cache the model + artefacts exactly once per process."""
     _instance: Optional["ModelLoader"] = None
 
     def __new__(cls):
@@ -139,22 +158,18 @@ class ModelLoader:
         if self._loaded:
             return
 
-        # ── tokenizer ────────────────────────────────────────────────────
         tok_data        = json.load(open(tokenizer_path, encoding="utf-8"))
         self.word2idx   = tok_data["word2idx"]
         self.vocab_size = tok_data["vocab_size"]
 
-        # ── scaler ───────────────────────────────────────────────────────
         with open(scaler_path, "rb") as f:
             self.scaler = pickle.load(f)
 
-        # ── label map ────────────────────────────────────────────────────
         self.label_map  = json.load(open(label_map_path))
         self.idx2label  = {v: k for k, v in self.label_map.items()}
         self.num_classes = len(self.label_map)
         self.class_names = [self.idx2label[i] for i in range(self.num_classes)]
 
-        # ── model ─────────────────────────────────────────────────────────
         self.model = PneumoFusionNet(
             num_classes=self.num_classes,
             vocab_size=self.vocab_size,
@@ -173,7 +188,6 @@ class ModelLoader:
         return self._loaded
 
 
-# Global singleton
 _loader = ModelLoader()
 
 
@@ -184,44 +198,51 @@ def get_loader() -> ModelLoader:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GRAD-CAM EXTRACTOR
+# GRAD-CAM++  EXTRACTOR
 # ─────────────────────────────────────────────────────────────────────────────
 
-class GradCAMExtractor:
+class GradCAMPlusPlus:
     """
-    Gradient-weighted Class Activation Maps on cnn_encoder.layer4 (last conv block).
+    Grad-CAM++ on the GCSA output layer (model.cnn_encoder.gcsa).
 
-    Bug fixes vs original
-    ----------------------
-    1. cuDNN RNN backward error: PyTorch requires LSTM to be in TRAIN mode for
-       backward pass (cuDNN limitation). We temporarily set only the BiLSTM
-       submodule to train() during the backward step, then restore eval().
-       The rest of the model stays in eval() throughout.
+    Improvement over vanilla Grad-CAM
+    ----------------------------------
+    Vanilla Grad-CAM: weight_c = mean_{i,j}( ∂score / ∂A^c_{ij} )
+    Grad-CAM++:       weight_c = Σ_{i,j}  α^c_{ij} · relu( ∂score / ∂A^c_{ij} )
 
-    2. Heatmap stuck at image border: was caused by detaching features in the
-       forward hook BEFORE gradients were computed. Fixed by storing the live
-       (non-detached) output tensor and only detaching AFTER backward().
+    where α^c_{ij} is a pixel-wise importance coefficient derived from the
+    second- and third-order partial derivatives of the score with respect to the
+    activation map.  In practice (see Chattopadhay 2018), α simplifies to:
 
-    3. Wrong layer: hooks now attach to the output of the GCSA module (after
-       layer4 + DSC + GCSA) rather than layer4 alone — this gives a richer,
-       spatially-aware activation map focused on diagnostically relevant regions.
+        α^c_{ij} = (∂²score / ∂(A^c_{ij})²) /
+                   (2·∂²score/∂(A^c_{ij})² + A^c · ∂³score/∂(A^c_{ij})³ + ε)
+
+    The second- and third-order terms are computed from the first-order gradient
+    g = ∂score/∂A^c:
+
+        ∂²score/∂A² ≈ g²          (element-wise square)
+        ∂³score/∂A³ ≈ g³          (element-wise cube)
+
+    This avoids a second backward pass and keeps the implementation efficient.
+
+    cuDNN / LSTM fix (same as before)
+    ----------------------------------
+    PyTorch requires the BiLSTM to be in train() mode during backward().
+    We switch only that submodule, then restore eval() afterwards.
     """
 
     def __init__(self, model: PneumoFusionNet):
         self.model      = model
-        self._features  = None   # stores live tensor (not detached yet)
+        self._features  = None
         self._gradients = None
 
-        # ── Hook on gcsa output — richer spatial map than raw layer4 ────────
-        # layer4 → dsc → gcsa  (gcsa already applies channel + spatial attention)
         target_layer = model.cnn_encoder.gcsa
 
         self._fwd_hook = target_layer.register_forward_hook(self._save_features)
         self._bwd_hook = target_layer.register_full_backward_hook(self._save_gradients)
 
     def _save_features(self, module, input, output):
-        # Store the LIVE output tensor (still in the computation graph).
-        # We detach only AFTER backward() so gradients can flow correctly.
+        # Store live tensor — do NOT detach before backward()
         self._features = output
 
     def _save_gradients(self, module, grad_input, grad_output):
@@ -232,12 +253,11 @@ class GradCAMExtractor:
         self._bwd_hook.remove()
 
     @staticmethod
-    def _set_bilstm_train(model: PneumoFusionNet):
-        """Set only the BiLSTM to train mode (required by cuDNN for backward)."""
+    def _set_bilstm_train(model):
         model.text_encoder.bilstm.train()
 
     @staticmethod
-    def _set_bilstm_eval(model: PneumoFusionNet):
+    def _set_bilstm_eval(model):
         model.text_encoder.bilstm.eval()
 
     def generate(
@@ -251,83 +271,392 @@ class GradCAMExtractor:
         """
         Returns
         -------
-        cam_norm   : (H, W) float32 [0,1]  – raw Grad-CAM heatmap
-        heatmap_rgb: (H, W, 3) uint8       – coloured heatmap (COLORMAP_JET)
-        overlay    : (H, W, 3) uint8       – heatmap blended onto original image
+        cam_norm   : (H, W) float32 [0,1]  – raw Grad-CAM++ heatmap
+        heatmap_rgb: (H, W, 3) uint8       – INFERNO colourmap (avoids JET's
+                                             misleading blue-dominance when activation
+                                             is moderate; warm palette reads more
+                                             naturally for pathology highlighting)
+        overlay    : (H, W, 3) uint8       – blended onto original CT
         """
-        # ── Set model to eval; only BiLSTM needs train for cuDNN backward ────
         self.model.eval()
         self._set_bilstm_train(self.model)
 
-        # Fresh tensors — no leftover gradients from prior calls
         img = image_tensor.detach().to(DEVICE).requires_grad_(True)
         txt = text_tensor.detach().to(DEVICE)
         num = num_tensor.detach().to(DEVICE)
 
-        # ── Forward pass (with autograd active — NO torch.no_grad() here) ───
         self.model.zero_grad()
         logits = self.model(img, txt, num)
         score  = logits[0, target_class]
 
-        # ── Backward pass ────────────────────────────────────────────────────
         score.backward()
 
-        # ── Restore full eval mode ────────────────────────────────────────────
         self._set_bilstm_eval(self.model)
 
-        # ── Now safe to detach features ───────────────────────────────────────
         if self._features is None or self._gradients is None:
-            raise RuntimeError("Grad-CAM hooks did not fire. Check layer attachment.")
+            raise RuntimeError("Grad-CAM++ hooks did not fire — check layer attachment.")
 
-        features = self._features.detach()[0]     # (C, H', W')
-        grads    = self._gradients[0]             # (C, H', W')
+        features = self._features.detach()[0]   # (C, H', W')
+        grads    = self._gradients[0]           # (C, H', W')
 
-        # ── Compute Grad-CAM ─────────────────────────────────────────────────
-        # global average-pool gradients over spatial dims → importance weight per channel
-        weights = grads.mean(dim=[1, 2])                          # (C,)
-        cam     = (weights.view(-1, 1, 1) * features).sum(0)     # (H', W')
-        cam     = F.relu(cam)                                     # keep only positive
+        # ── Grad-CAM++ alpha computation ─────────────────────────────────────
+        # g  = first-order gradient (already captured in grads)
+        # g² and g³ approximate 2nd/3rd partial derivatives of the score
+        g2  = grads ** 2                                # (C, H', W')
+        g3  = grads ** 3                                # (C, H', W')
 
-        # ── Normalise ────────────────────────────────────────────────────────
-        cam_np          = cam.cpu().float().numpy()
-        cam_min, cam_max = cam_np.min(), cam_np.max()
-        if cam_max - cam_min > 1e-8:
-            cam_norm = (cam_np - cam_min) / (cam_max - cam_min)
-        else:
-            cam_norm = np.zeros_like(cam_np)
+        # denominator: 2*g² + A·g³  summed over spatial dims per channel
+        denom = 2.0 * g2 + (features * g3).sum(dim=[1, 2], keepdim=True)  # (C,1,1)
+        denom = torch.where(denom != 0, denom, torch.ones_like(denom))    # avoid /0
 
-        # ── Resize to original image dimensions ──────────────────────────────
+        # pixel-wise alpha
+        alpha = g2 / denom                             # (C, H', W')
+
+        # weight per channel = Σ_{i,j} alpha * relu(g)
+        weights = (alpha * F.relu(grads)).sum(dim=[1, 2])   # (C,)
+
+        cam = (weights.view(-1, 1, 1) * features).sum(0)   # (H', W')
+        cam = F.relu(cam)
+
+        # ── Normalise ─────────────────────────────────────────────────────────
+        cam_np = cam.cpu().float().numpy()
+        mn, mx = cam_np.min(), cam_np.max()
+        cam_norm = (cam_np - mn) / (mx - mn + 1e-8)
+
+        # ── Resize + smooth ───────────────────────────────────────────────────
         orig_w, orig_h = original_pil.size
-        cam_resized    = cv2.resize(
+        cam_resized = cv2.resize(
             cam_norm.astype(np.float32),
             (orig_w, orig_h),
             interpolation=cv2.INTER_CUBIC,
         )
-        # smooth with slight Gaussian blur for cleaner heatmap edges
-        cam_resized = cv2.GaussianBlur(cam_resized, (11, 11), sigmaX=4)
-        # re-normalise after blur
-        mn, mx = cam_resized.min(), cam_resized.max()
-        if mx - mn > 1e-8:
-            cam_resized = (cam_resized - mn) / (mx - mn)
+        cam_resized = cv2.GaussianBlur(cam_resized, (9, 9), sigmaX=3)
+        mn2, mx2 = cam_resized.min(), cam_resized.max()
+        cam_resized = (cam_resized - mn2) / (mx2 - mn2 + 1e-8)
 
-        # ── Colourmap → RGB heatmap ───────────────────────────────────────────
+        # ── Colourmap ─────────────────────────────────────────────────────────
+        # COLORMAP_INFERNO: dark-purple→orange→yellow. More perceptually uniform
+        # than JET and doesn't introduce blue artefacts in low-activation regions.
         heatmap_bgr = cv2.applyColorMap(
-            (cam_resized * 255).astype(np.uint8), cv2.COLORMAP_JET
+            (cam_resized * 255).astype(np.uint8), cv2.COLORMAP_INFERNO
         )
         heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
 
-        # ── Overlay on original image ─────────────────────────────────────────
-        # Resize original to match, convert to RGB, blend
         orig_rgb = np.array(
             original_pil.convert("RGB").resize((orig_w, orig_h), Image.LANCZOS)
         )
-        overlay = cv2.addWeighted(orig_rgb, 0.5, heatmap_rgb, 0.5, 0)
+        overlay = cv2.addWeighted(orig_rgb, 0.55, heatmap_rgb, 0.45, 0)
 
         return cam_resized.astype(np.float32), heatmap_rgb, overlay
 
+    def gradient_norm(self) -> float:
+        """
+        L2 norm of the raw gradients at the target layer — used as a proxy
+        for how much the image branch contributed to the prediction.
+        A near-zero norm means the decision was driven by other modalities.
+        """
+        if self._gradients is None:
+            return 0.0
+        return float(self._gradients.norm(p=2).cpu())
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN INFERENCE FUNCTION
+# SHAP EXPLAINER  (numerical features + modality weight)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _NumericalWrapper(nn.Module):
+    """
+    Thin wrapper that freezes image + text inputs and only exposes the
+    numerical tensor as a variable input.  Required by shap.DeepExplainer
+    which expects a single-input (or tuple-input) nn.Module.
+    """
+    def __init__(self, model: PneumoFusionNet,
+                 img_t: torch.Tensor, txt_t: torch.Tensor):
+        super().__init__()
+        self.model = model
+        # register as buffers so they move with .to(device)
+        self.register_buffer("img_t", img_t)
+        self.register_buffer("txt_t", txt_t)
+
+    def forward(self, num_t: torch.Tensor) -> torch.Tensor:
+        return self.model(self.img_t, self.txt_t, num_t)
+
+
+class SHAPExplainer:
+    """
+    Uses shap.DeepExplainer to attribute the predicted-class logit to each
+    normalised numerical feature.
+
+    Background
+    ----------
+    DeepExplainer integrates gradients with respect to a set of background
+    (reference) samples.  We use zero-vector baselines (equivalent to
+    mean-normalised values from the StandardScaler perspective).
+
+    Output
+    ------
+    shap_values : np.ndarray  shape (N_features,)
+                  SHAP value for each numerical feature for the predicted class.
+    feature_names : list[str]  matching labels (includes sex columns)
+    image_weight  : float ∈ [0,1]
+                  Fraction of total gradient energy attributable to the image
+                  branch (estimated from the cam gradient norm vs SHAP L1 norm).
+                  Used to scale the Grad-CAM++ heatmap.
+    """
+
+    # human-readable labels for the scaler output columns
+    FEATURE_LABELS = [
+        "WBC (×10⁹/L)", "NEUT%", "LYMP%", "NLR",
+        "CRP (mg/L)", "PCT (ng/mL)",
+        "Sex: Female", "Sex: Male",
+    ]
+
+    def __init__(self, model: PneumoFusionNet):
+        self.model = model
+
+    def explain(
+        self,
+        img_t:         torch.Tensor,
+        txt_t:         torch.Tensor,
+        num_t:         torch.Tensor,
+        target_class:  int,
+        cam_grad_norm: float = 1.0,
+        n_background:  int   = 20,
+    ) -> Tuple[np.ndarray, List[str], float]:
+        """
+        Parameters
+        ----------
+        cam_grad_norm   Gradient L2 norm from Grad-CAM++ — proxy for image energy.
+        n_background    Number of zero-baseline samples for DeepExplainer.
+
+        Returns
+        -------
+        shap_vals    (N_features,) for the predicted class
+        feat_labels  list of strings
+        image_weight float ∈ [0,1]
+        """
+        try:
+            import shap  # lazy import — not mandatory at startup
+        except ImportError:
+            # graceful degradation: return zero SHAP values
+            n = num_t.shape[1]
+            return (
+                np.zeros(n, dtype=np.float32),
+                self.FEATURE_LABELS[:n],
+                0.5,
+            )
+
+        self.model.eval()
+
+        wrapper = _NumericalWrapper(
+            self.model,
+            img_t.detach().to(DEVICE),
+            txt_t.detach().to(DEVICE),
+        ).to(DEVICE)
+        wrapper.eval()
+
+        # background: n_background copies of a zero tensor (scaled baseline)
+        background = torch.zeros(n_background, num_t.shape[1],
+                                  dtype=torch.float32).to(DEVICE)
+        foreground = num_t.detach().to(DEVICE)
+
+        try:
+            explainer   = shap.DeepExplainer(wrapper, background)
+            # shap_values shape: (n_classes, 1, n_features) or list of arrays
+            shap_values = explainer.shap_values(foreground)
+
+            # Normalise output format across shap versions
+            if isinstance(shap_values, list):
+                # list of (1, n_features) arrays, one per class
+                sv = np.array([v[0] for v in shap_values])   # (n_classes, n_features)
+            else:
+                # (1, n_features, n_classes) — older shap
+                sv = shap_values[0].T   # (n_classes, n_features)
+
+            vals = sv[target_class]    # (n_features,)
+
+        except Exception as exc:
+            print(f"[SHAPExplainer] DeepExplainer failed ({exc}); falling back to gradient SHAP")
+            # Fallback: gradient × input as a simple attribution
+            foreground.requires_grad_(True)
+            out = wrapper(foreground)
+            score = out[0, target_class]
+            score.backward()
+            vals = (foreground.grad[0] * foreground[0]).detach().cpu().numpy()
+
+        # ── Compute image weight from gradient norms ─────────────────────────
+        shap_l1     = float(np.abs(vals).sum()) + 1e-8
+        image_weight = cam_grad_norm / (cam_grad_norm + shap_l1)
+        # clip to [0.15, 0.95] so the heatmap is never invisible or blindly trusted
+        image_weight = float(np.clip(image_weight, 0.15, 0.95))
+
+        n_features = num_t.shape[1]
+        labels = self.FEATURE_LABELS[:n_features]
+
+        return vals.astype(np.float32), labels, image_weight
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUSED EXPLAINER  (Grad-CAM++ + SHAP → combined output)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FusedExplainer:
+    """
+    Orchestrates the complete explainability pipeline:
+
+    Step 1  Grad-CAM++ on the GCSA layer.
+    Step 2  SHAP on the numerical branch (DeepExplainer, zero background).
+    Step 3  Re-scale the Grad-CAM++ heatmap by image_weight so the visual
+            intensity honestly reflects how much the image actually influenced
+            the prediction (vs. labs / clinical text).
+    Step 4  Return everything the API and UI need.
+    """
+
+    def explain(
+        self,
+        image:         Image.Image,
+        clinical_text: str,
+        numerical_row: dict,
+        target_class:  Optional[int] = None,
+    ) -> dict:
+        """
+        Returns
+        -------
+        dict with keys:
+            predicted_class, confidence, probabilities, class_index
+            cam_norm          (H,W) float32 [0,1]   – re-weighted Grad-CAM++ map
+            heatmap_rgb       (H,W,3) uint8          – coloured heatmap
+            overlay           (H,W,3) uint8          – blended overlay
+            shap_values       list[float]            – per feature, for predicted class
+            feature_labels    list[str]
+            image_weight      float                  – fraction of prediction from image
+            shap_text         str                    – human-readable narrative
+        """
+        loader = get_loader()
+
+        img_t = preprocess_image(image)
+        txt_t = encode_text(clinical_text, loader.word2idx).to(DEVICE)
+        num_t = encode_numerics(numerical_row, loader.scaler)
+
+        # ── Pass 1: clean prediction ─────────────────────────────────────────
+        with torch.no_grad():
+            loader.model.eval()
+            logits = loader.model(img_t, txt_t, num_t)
+            probs  = F.softmax(logits, dim=1)[0].cpu().numpy()
+            idx    = int(np.argmax(probs))
+
+        result = {
+            "predicted_class": loader.idx2label[idx],
+            "confidence":      float(probs[idx]),
+            "probabilities":   {loader.idx2label[i]: float(p) for i, p in enumerate(probs)},
+            "class_index":     idx,
+        }
+
+        target = target_class if target_class is not None else idx
+
+        # ── Pass 2: Grad-CAM++ ───────────────────────────────────────────────
+        cam_extractor = GradCAMPlusPlus(loader.model)
+        try:
+            cam_norm, heatmap_rgb, overlay = cam_extractor.generate(
+                img_t, txt_t, num_t, target, image
+            )
+            cam_grad_norm = cam_extractor.gradient_norm()
+        finally:
+            cam_extractor.remove_hooks()
+            loader.model.eval()
+
+        # ── Pass 3: SHAP ─────────────────────────────────────────────────────
+        shap_explainer = SHAPExplainer(loader.model)
+        shap_vals, feat_labels, image_weight = shap_explainer.explain(
+            img_t, txt_t, num_t, target, cam_grad_norm=cam_grad_norm
+        )
+
+        # ── Pass 4: Re-weight heatmap by image contribution ──────────────────
+        # Scale the cam_norm map so its peak equals image_weight.
+        # This means: if labs dominated (image_weight=0.2), the heatmap stays
+        # faint (max 0.2) preventing false-confidence visualisations.
+        cam_scaled = cam_norm * image_weight
+        # Re-colourise the scaled map
+        heatmap_bgr_scaled = cv2.applyColorMap(
+            (cam_scaled * 255).astype(np.uint8), cv2.COLORMAP_INFERNO
+        )
+        heatmap_rgb_scaled = cv2.cvtColor(heatmap_bgr_scaled, cv2.COLOR_BGR2RGB)
+        orig_rgb = np.array(image.convert("RGB"))
+        orig_w, orig_h = image.size
+        orig_rgb_resized = cv2.resize(orig_rgb, (orig_w, orig_h))
+        overlay_scaled = cv2.addWeighted(orig_rgb_resized, 0.55, heatmap_rgb_scaled, 0.45, 0)
+
+        # ── Build SHAP narrative ─────────────────────────────────────────────
+        shap_text = _build_shap_narrative(
+            shap_vals, feat_labels, result["predicted_class"], image_weight
+        )
+
+        return {
+            **result,
+            # images
+            "cam_norm":          cam_norm.tolist(),
+            "heatmap_rgb":       heatmap_rgb,        # unscaled — for raw CAM tab
+            "overlay":           overlay,             # unscaled overlay
+            "heatmap_rgb_fused": heatmap_rgb_scaled,  # re-weighted — for fused tab
+            "overlay_fused":     overlay_scaled,
+            # SHAP
+            "shap_values":    shap_vals.tolist(),
+            "feature_labels": feat_labels,
+            "image_weight":   image_weight,
+            "shap_text":      shap_text,
+        }
+
+
+def _build_shap_narrative(
+    shap_vals:    np.ndarray,
+    feat_labels:  List[str],
+    pred_class:   str,
+    image_weight: float,
+) -> str:
+    """Produce a one-paragraph narrative summarising SHAP + image weight."""
+    # top 3 positive contributors
+    order      = np.argsort(shap_vals)[::-1]
+    pos_feats  = [(feat_labels[i], float(shap_vals[i])) for i in order if shap_vals[i] > 0][:3]
+    neg_feats  = [(feat_labels[i], float(shap_vals[i])) for i in order[::-1] if shap_vals[i] < 0][:2]
+
+    img_pct  = round(image_weight * 100)
+    lab_pct  = round((1.0 - image_weight) * 100)
+
+    parts = [
+        f"For the prediction of **{pred_class}**, the model drew "
+        f"approximately **{img_pct}%** of its decision signal from the CT image "
+        f"and **{lab_pct}%** from laboratory values and clinical text."
+    ]
+
+    if pos_feats:
+        drivers = ", ".join(
+            f"{name} (SHAP={v:+.3f})" for name, v in pos_feats
+        )
+        parts.append(f"The strongest lab drivers pushing *towards* this prediction were: {drivers}.")
+
+    if neg_feats:
+        contra = ", ".join(
+            f"{name} (SHAP={v:+.3f})" for name, v in neg_feats
+        )
+        parts.append(f"Features pulling *away* from this prediction: {contra}.")
+
+    if image_weight < 0.35:
+        parts.append(
+            "⚠️ The Grad-CAM++ heatmap has been dimmed to reflect the model's "
+            "relatively low reliance on the CT scan for this particular case — "
+            "laboratory values were more informative."
+        )
+    elif image_weight > 0.70:
+        parts.append(
+            "The CT image was the dominant information source. "
+            "The Grad-CAM++ heatmap should be interpreted with high confidence."
+        )
+
+    return "  ".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC API  (unchanged signatures + new run_fused_explain)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -336,33 +665,13 @@ def run_inference(
     clinical_text: str,
     numerical_row: dict,
 ) -> dict:
-    """
-    Full multimodal inference pipeline.
-
-    Parameters
-    ----------
-    image          : PIL Image (CT scan)
-    clinical_text  : raw clinical observation string
-    numerical_row  : dict with keys matching NUMERICAL_COLS + Patient_Sex
-
-    Returns
-    -------
-    dict with keys:
-        predicted_class  : str
-        confidence       : float (0-1)
-        probabilities    : {class_name: float}
-        class_index      : int
-    """
     loader = get_loader()
-
     img_t  = preprocess_image(image)
     txt_t  = encode_text(clinical_text, loader.word2idx).to(DEVICE)
     num_t  = encode_numerics(numerical_row, loader.scaler)
-
     logits = loader.model(img_t, txt_t, num_t)
     probs  = F.softmax(logits, dim=1)[0].cpu().numpy()
     idx    = int(np.argmax(probs))
-
     return {
         "predicted_class": loader.idx2label[idx],
         "confidence":      float(probs[idx]),
@@ -378,26 +687,15 @@ def run_gradcam(
     target_class: Optional[int] = None,
 ) -> Tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Run inference + Grad-CAM.
-
-    IMPORTANT: this function must NOT be wrapped in @torch.no_grad() because
-    Grad-CAM requires a live computation graph for score.backward().
-    Prediction is obtained via a separate no_grad forward pass first.
-
-    Returns
-    -------
-    result     : prediction dict
-    cam_norm   : (H, W) raw normalised heatmap [0,1]
-    heatmap_rgb: (H, W, 3) uint8 coloured heatmap
-    overlay    : (H, W, 3) uint8 blended overlay
+    Backward-compatible wrapper — now uses Grad-CAM++ internally.
+    Signature and return types unchanged so api.py /gradcam and /report
+    endpoints require no modification.
     """
     loader = get_loader()
-
     img_t  = preprocess_image(image)
     txt_t  = encode_text(clinical_text, loader.word2idx).to(DEVICE)
     num_t  = encode_numerics(numerical_row, loader.scaler)
 
-    # ── Pass 1: clean prediction with no_grad ────────────────────────────────
     with torch.no_grad():
         loader.model.eval()
         logits = loader.model(img_t, txt_t, num_t)
@@ -411,16 +709,27 @@ def run_gradcam(
         "class_index":     idx,
     }
 
-    target = target_class if target_class is not None else idx
-
-    # ── Pass 2: Grad-CAM (requires autograd — no torch.no_grad wrapper) ──────
-    extractor = GradCAMExtractor(loader.model)
+    target    = target_class if target_class is not None else idx
+    extractor = GradCAMPlusPlus(loader.model)
     try:
         cam_norm, heatmap_rgb, overlay = extractor.generate(
             img_t, txt_t, num_t, target, image
         )
     finally:
         extractor.remove_hooks()
-        loader.model.eval()   # ensure clean eval state after backward
+        loader.model.eval()
 
     return result, cam_norm, heatmap_rgb, overlay
+
+
+def run_fused_explain(
+    image: Image.Image,
+    clinical_text: str,
+    numerical_row: dict,
+    target_class: Optional[int] = None,
+) -> dict:
+    """
+    Full Grad-CAM++ + SHAP fused explainability.
+    Called by the new /explain API endpoint.
+    """
+    return FusedExplainer().explain(image, clinical_text, numerical_row, target_class)

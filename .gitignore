@@ -1,7 +1,5 @@
 projectvenv/
 __pycache__/
 images/
-outputs/
 *.pt
 *.pth
-*.pkl

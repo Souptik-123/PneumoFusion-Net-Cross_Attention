@@ -1,6 +1,15 @@
 """
 main.py  –  Orchestration script for PneumoFusion-Net
-                                                          
+
+FIXES vs previous version
+--------------------------
+• validate() no longer accepts a criterion argument (FIX 1 in trainer.py).
+  All call-sites updated accordingly.
+• export_vocab_scaler() receives the scaler that was fitted on training
+  data only — guaranteed by the fixed get_fold_dataloaders() (FIX 1 in
+  data_pipeline.py).
+• No other orchestration changes; leakage fixes live in their own modules.
+
 Usage
 -----
     python main.py                     # full 5-fold CV + fine-tune best fold
@@ -32,7 +41,6 @@ import numpy as np
 import torch
 from sklearn.model_selection import StratifiedKFold
 
-# ── local imports ─────────────────────────────────────────────────────────
 from config import (
     CSV_PATH, DATA_ROOT, K_FOLDS, SEED, BATCH_SIZE,
     DEVICE, CHECKPOINT_DIR, RESULTS_DIR,
@@ -43,8 +51,8 @@ from config import (
 )
 from data_pipeline import load_dataframe, get_fold_dataloaders, build_label_map
 from models import PneumoFusionNet
-from trainer     import train_fold, finetune_fold, export_vocab_scaler
-from evaluate    import (
+from trainer import train_fold, finetune_fold, export_vocab_scaler
+from evaluate import (
     evaluate_model, plot_confusion_matrix, plot_training_curves,
     aggregate_cv_results, save_fold_results, log_modality_weights,
 )
@@ -112,8 +120,10 @@ def main():
 
     # ── 1.  Load data ──────────────────────────────────────────────────────
     print_banner("Loading dataset")
+    print(f"  CSV path: {os.path.join(DATA_ROOT, CSV_PATH)}")
     df = load_dataframe(os.path.join(DATA_ROOT, CSV_PATH))
-    label_map = build_label_map(df["label"])
+    # build_label_map uses only unique label strings — no leakage
+    label_map   = build_label_map(df["label"])
     num_classes = len(label_map)
     class_names = sorted(label_map, key=lambda k: label_map[k])
 
@@ -135,8 +145,9 @@ def main():
         train_loader, val_loader, vocab, _ = get_fold_dataloaders(
             df, fold, skf, label_map, batch_size=args.batch_size
         )
-        model = PneumoFusionNet(num_classes=num_classes, vocab_size=len(vocab),
-                                pretrained_cnn=False)
+        model = PneumoFusionNet(
+            num_classes=num_classes, vocab_size=len(vocab), pretrained_cnn=False
+        )
         ckpt = torch.load(args.ckpt, map_location=DEVICE)
         model.load_state_dict(ckpt["model_state"])
         print_banner(f"Evaluating checkpoint: {args.ckpt}")
@@ -147,17 +158,20 @@ def main():
     # ── 4.  Cross-validation ───────────────────────────────────────────────
     folds_to_run = [args.fold] if args.fold is not None else list(range(K_FOLDS))
 
-    cv_metrics         = []
-    cv_finetune_metrics= []
-    best_cv_f1         = -1.0
-    best_fold          = 0
+    cv_metrics          = []
+    cv_finetune_metrics = []
+    best_cv_f1          = -1.0
+    best_fold           = 0
 
     for fold in folds_to_run:
-        set_seed(SEED + fold)    # different seed per fold for reproducibility
+        set_seed(SEED + fold)
 
         print_banner(f"FOLD {fold+1} / {K_FOLDS}")
 
         # ── DataLoaders ───────────────────────────────────────────────────
+        # get_fold_dataloaders now guarantees:
+        #   • vocab built on train text only
+        #   • scaler fitted on train numerics only
         train_loader, val_loader, vocab, scaler = get_fold_dataloaders(
             df, fold, skf, label_map, batch_size=args.batch_size
         )
@@ -185,28 +199,30 @@ def main():
         model.load_state_dict(ckpt["model_state"])
 
         print_banner(f"Evaluation – Fold {fold+1}")
-        metrics, y_true, y_pred, y_prob = evaluate_model(model, val_loader, class_names)
+        metrics, y_true, y_pred, y_prob = evaluate_model(
+            model, val_loader, class_names
+        )
         cv_metrics.append(metrics)
 
         # ── Plots ─────────────────────────────────────────────────────────
         plot_confusion_matrix(y_true, y_pred, fold, class_names)
         plot_training_curves(history, fold)
         save_fold_results(metrics, fold)
-        log_modality_weights(model, fold)          # ← learned contribution %
+        log_modality_weights(model, fold)
 
-        # track best fold for fine-tuning
+        # Track best fold for fine-tuning
         if metrics["f1_macro"] > best_cv_f1:
-            best_cv_f1  = metrics["f1_macro"]
-            best_fold   = fold
-            # save vocab/scaler for best fold (for inference later)
+            best_cv_f1 = metrics["f1_macro"]
+            best_fold  = fold
             torch.save(
-                {"vocab": vocab.word2idx, "scaler_mean": scaler.mean_,
-                 "scaler_std": np.sqrt(scaler.var_), "label_map": label_map},
+                {
+                    "vocab":       vocab.word2idx,
+                    "scaler_mean": scaler.mean_,
+                    "scaler_std":  np.sqrt(scaler.var_),
+                    "label_map":   label_map,
+                },
                 os.path.join(CHECKPOINT_DIR, "best_fold_meta.pt"),
             )
-
-        # Fine-tuning is deferred: runs ONLY on the best fold after all
-        # folds complete.  See the section below the CV loop.
 
     # ── 5.  Aggregate CV results ──────────────────────────────────────────
     if len(cv_metrics) > 1:
@@ -215,14 +231,16 @@ def main():
 
     # ── 6.  Fine-tune BEST FOLD ONLY ──────────────────────────────────────
     if not args.no_finetune and len(folds_to_run) > 0:
-        print_banner(f"Fine-tuning BEST fold only: Fold {best_fold+1}  (F1={best_cv_f1*100:.2f}%)")
+        print_banner(
+            f"Fine-tuning BEST fold only: Fold {best_fold+1}  "
+            f"(F1={best_cv_f1*100:.2f}%)"
+        )
 
-        # reload the best-fold DataLoaders + vocab/scaler
+        # Rebuild best-fold DataLoaders with the same fixed pipeline
         train_loader_bf, val_loader_bf, vocab_bf, scaler_bf = get_fold_dataloaders(
             df, best_fold, skf, label_map, batch_size=args.batch_size
         )
 
-        # rebuild model and load best checkpoint
         model_ft = PneumoFusionNet(
             num_classes=num_classes,
             vocab_size=len(vocab_bf),
@@ -239,7 +257,7 @@ def main():
             epochs=FINETUNE_EPOCHS, lr=FINETUNE_LR,
         )
 
-        # load best fine-tuned checkpoint for final evaluation
+        # Load best fine-tuned checkpoint for final evaluation
         ft_ckpt = torch.load(
             os.path.join(CHECKPOINT_DIR, f"fold{best_fold}_finetuned.pt"),
             map_location=DEVICE,
@@ -251,20 +269,19 @@ def main():
             model_ft, val_loader_bf, class_names
         )
 
-        plot_confusion_matrix(ft_y_true, ft_y_pred, best_fold, class_names, suffix="_finetuned")
+        plot_confusion_matrix(
+            ft_y_true, ft_y_pred, best_fold, class_names, suffix="_finetuned"
+        )
         plot_training_curves(ft_history, best_fold, suffix="_finetuned")
         save_fold_results(ft_eval_metrics, best_fold, suffix="_finetuned")
         log_modality_weights(model_ft, best_fold, suffix="_finetuned")
 
-        # ── Export tokenizer.json + scaler.pkl from best fold ─────────────
+        # Export tokenizer + scaler from best fold
+        # scaler_bf was fitted on training data only (guaranteed by fixed pipeline)
         print_banner("Exporting tokenizer + scaler (best fold)")
         export_vocab_scaler(vocab_bf, scaler_bf, label_map, best_fold)
 
         cv_finetune_metrics.append(ft_eval_metrics)
-    elif not args.no_finetune:
-        # single-fold run: export from that fold's vocab/scaler
-        # (vocab/scaler already saved via best_fold_meta.pt above)
-        pass
 
     # ── 7.  Final summary ─────────────────────────────────────────────────
     print_banner("DONE")

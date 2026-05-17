@@ -137,7 +137,7 @@ st.markdown("""
 }
 .report-section h4 { color: #7EB8F7; margin-top: 0; }
 
-/* Warning box */
+/* Warning / success / info boxes */
 .warning-box {
     background: rgba(220, 53, 69, 0.12);
     border: 1px solid #DC3545;
@@ -151,6 +151,15 @@ st.markdown("""
     border-radius: 10px;
     padding: 14px 18px;
     margin: 10px 0;
+}
+.info-box {
+    background: rgba(74, 144, 217, 0.10);
+    border: 1px solid #4A90D9;
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin: 10px 0;
+    font-size: 0.88rem;
+    color: #CBD5E0;
 }
 
 /* Disclaimer */
@@ -234,6 +243,7 @@ def section_header(title: str):
     st.markdown(f'<div class="section-header">{title}</div>', unsafe_allow_html=True)
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
@@ -252,8 +262,7 @@ def render_sidebar():
 
         st.divider()
 
-        # Backend status
-        backend_ok = check_backend()
+        backend_ok   = check_backend()
         status_icon  = "🟢" if backend_ok else "🔴"
         status_label = "Connected" if backend_ok else "Offline"
         st.markdown(f"**API Status:** {status_icon} {status_label}")
@@ -261,7 +270,6 @@ def render_sidebar():
 
         st.divider()
 
-        # OpenAI key input
         st.markdown("**🔑 OpenAI API Key**")
         st.markdown("<small>Required for AI report generation</small>", unsafe_allow_html=True)
         openai_api_key = st.text_input(
@@ -303,7 +311,6 @@ def render_home():
     </div>
     """, unsafe_allow_html=True)
 
-    # Feature cards
     cols = st.columns(3)
     features = [
         ("🖼️", "CT Scan Analysis", "ResNet50 + GCSA + Depthwise-Separable Conv for fine-grained pulmonary lesion detection"),
@@ -320,23 +327,6 @@ def render_home():
             </div>
             """, unsafe_allow_html=True)
 
-    cols2 = st.columns(3)
-    features2 = [
-        ("🧠", "Cross-Attention Fusion", "Each modality queries the others as key-value context for dynamic importance weighting"),
-        ("🌡️", "Grad-CAM Heatmaps",    "Gradient-weighted Class Activation Maps highlight diagnostically relevant CT regions"),
-        ("📋", "AI Reports",            "GPT-4.1-powered clinical summary with recommendations and emergency warning signs"),
-    ]
-    for col, (icon, title, desc) in zip(cols2, features2):
-        with col:
-            st.markdown(f"""
-            <div class="metric-card">
-              <div style="font-size:1.8rem">{icon}</div>
-              <div style="font-size:1rem;font-weight:600;color:#7EB8F7;margin:6px 0">{title}</div>
-              <div style="font-size:0.82rem;color:#A0AEC0">{desc}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-    # Classes
     st.divider()
     section_header("Detectable Conditions")
     cls_cols = st.columns(len(CLASS_COLORS))
@@ -359,11 +349,9 @@ def render_diagnose():
     st.markdown("<small style='color:#718096'>Fill in all three modalities for best accuracy</small>",
                 unsafe_allow_html=True)
 
-    # ── INPUT PANEL ─────────────────────────────────────────────────────────
     with st.container():
         left, right = st.columns([1, 1], gap="large")
 
-        # ── LEFT: IMAGE + TEXT ─────────────────────────────────────────────
         with left:
             section_header("CT Scan Upload")
             uploaded_file = st.file_uploader(
@@ -386,7 +374,6 @@ def render_diagnose():
                 key="clinical_text",
             )
 
-        # ── RIGHT: LAB PARAMETERS ──────────────────────────────────────────
         with right:
             section_header("Patient Demographics")
             d1, d2 = st.columns(2)
@@ -411,34 +398,33 @@ def render_diagnose():
                         value=default, step=step, format="%.2f",
                     )
 
-    # ── REFERENCE RANGES TABLE ────────────────────────────────────────────
     with st.expander("📊 Reference Ranges", expanded=False):
         ref_data = {
-            "Parameter": ["WBC (×10⁹/L)", "NEUT%", "LYMP%", "NLR", "CRP (mg/L)", "PCT (ng/mL)"],
+            "Parameter":   ["WBC (×10⁹/L)", "NEUT%", "LYMP%", "NLR", "CRP (mg/L)", "PCT (ng/mL)"],
             "Normal Low":  [4.0, 50.0, 20.0, 1.0, 0.0, 0.0],
             "Normal High": [11.0, 70.0, 40.0, 3.0, 10.0, 0.5],
             "Your Value":  [
                 lab_values.get("WBC (x10^9/L)", 0),
-                lab_values.get("NEUT%", 0),
-                lab_values.get("LYMP%", 0),
-                lab_values.get("NLR", 0),
-                lab_values.get("CRP (mg/L)", 0),
-                lab_values.get("PCT (ng/mL)", 0),
+                lab_values.get("NEUT%",         0),
+                lab_values.get("LYMP%",         0),
+                lab_values.get("NLR",           0),
+                lab_values.get("CRP (mg/L)",    0),
+                lab_values.get("PCT (ng/mL)",   0),
             ],
         }
         import pandas as pd
         df = pd.DataFrame(ref_data)
         def _flag(row):
             v, lo, hi = row["Your Value"], row["Normal Low"], row["Normal High"]
-            if v < lo:   return [""] * 3 + ["background-color: #3730a322"]
-            if v > hi:   return [""] * 3 + ["background-color: #dc354522"]
-            return       [""] * 4
+            if v < lo:  return [""] * 3 + ["background-color: #3730a322"]
+            if v > hi:  return [""] * 3 + ["background-color: #dc354522"]
+            return      [""] * 4
         st.dataframe(df.style.apply(_flag, axis=1), use_container_width=True, hide_index=True)
 
-    # ── SUBMIT BUTTON ─────────────────────────────────────────────────────
     st.divider()
+
     run_btn = st.button(
-        "🚀  Run Multimodal Analysis",
+        "🚀  Run Multimodal Analysis + Report",
         type="primary",
         use_container_width=True,
         disabled=(uploaded_file is None),
@@ -447,77 +433,66 @@ def render_diagnose():
     if uploaded_file is None:
         st.info("👆 Please upload a CT scan image to enable analysis.")
 
-    # ── INFERENCE + RESULTS ───────────────────────────────────────────────
+    # ── Run report ─────────────────────────────────────────────────────────
     if run_btn and uploaded_file is not None:
-        numerical_row = {
-            "Patient_Age":   age,
-            "Patient_Sex":   sex,
-            **lab_values,
-        }
-
-        with st.spinner("🧠  Running multimodal inference + Grad-CAM..."):
+        with st.spinner("🧠  Running multimodal inference + Grad-CAM++..."):
             uploaded_file.seek(0)
-            files   = {"ct_image": (uploaded_file.name, uploaded_file, "image/jpeg")}
-            data    = {
+            files = {"ct_image": (uploaded_file.name, uploaded_file, "image/jpeg")}
+            data  = {
                 "clinical_text": clinical_text or "",
-                "age":   age,   "sex":  sex,
-                "wbc":   lab_values["WBC (x10^9/L)"],
-                "neut":  lab_values["NEUT%"],
-                "lymp":  lab_values["LYMP%"],
-                "nlr":   lab_values["NLR"],
-                "crp":   lab_values["CRP (mg/L)"],
-                "pct":   lab_values["PCT (ng/mL)"],
+                "age": age, "sex": sex,
+                "wbc":  lab_values["WBC (x10^9/L)"],
+                "neut": lab_values["NEUT%"],
+                "lymp": lab_values["LYMP%"],
+                "nlr":  lab_values["NLR"],
+                "crp":  lab_values["CRP (mg/L)"],
+                "pct":  lab_values["PCT (ng/mL)"],
                 "openai_key": st.session_state.get("openai_api_key", ""),
             }
             try:
-                resp = requests.post(
-                    f"{BACKEND_URL}/report",
-                    files=files, data=data,
-                    timeout=120,
-                )
+                resp = requests.post(f"{BACKEND_URL}/report",
+                                     files=files, data=data, timeout=120)
                 resp.raise_for_status()
-                result = resp.json()
-                st.session_state["last_result"] = result
+                st.session_state["last_result"] = resp.json()
             except requests.exceptions.ConnectionError:
                 st.error("❌ Cannot connect to backend. Is the FastAPI server running?")
-                st.code(f"uvicorn webapp.backend.api:app --host 0.0.0.0 --port 8000")
+                st.code("uvicorn webapp.backend.api:app --host 0.0.0.0 --port 8000")
                 return
             except Exception as e:
                 st.error(f"❌ API error: {e}")
-                if "resp" in dir():
-                    st.code(resp.text[:500])
                 return
 
-    # ── RENDER RESULTS ────────────────────────────────────────────────────
+    # ── Render results ─────────────────────────────────────────────────────
     if "last_result" in st.session_state:
         result = st.session_state["last_result"]
+        st.divider()
+        st.markdown("## 📊 Diagnosis Results")
         _render_results(result)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RESULTS RENDERER  (Diagnosis tab)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _render_results(result: dict):
-    """Render the full results dashboard."""
-    st.divider()
-    st.markdown("## 📊 Diagnosis Results")
     st.markdown(
         f"<small style='color:#718096'>Analysis completed in "
-        f"{result.get('total_ms', 0):.0f} ms</small>",
+        f"{result.get('total_ms', result.get('inference_ms', 0)):.0f} ms</small>",
         unsafe_allow_html=True,
     )
 
-    # ── ROW 1: Prediction + Probabilities ─────────────────────────────────
     pred_col, prob_col = st.columns([1, 2], gap="large")
 
     with pred_col:
         section_header("Prediction")
         prediction_badge(result["predicted_class"], result["confidence"])
 
-        color = CLASS_COLORS.get(result["predicted_class"], "#4A90D9")
         severity_map = {
             "Normal":              ("✅ No Pneumonia Detected", "success-box"),
-            "Bacterial Pneumonia": ("⚠️ Bacterial Infection", "warning-box"),
-            "Viral Pneumonia":     ("⚠️ Viral Infection",     "warning-box"),
-            "Tuberculosis":        ("🚨 TB Suspected",         "warning-box"),
-            "Covid-19":            ("⚠️ COVID-19 Suspected",   "warning-box"),
+            "Bacterial Pneumonia": ("⚠️ Bacterial Infection",   "warning-box"),
+            "Viral Pneumonia":     ("⚠️ Viral Infection",       "warning-box"),
+            "Tuberculosis":        ("🚨 TB Suspected",           "warning-box"),
+            "Covid-19":            ("⚠️ COVID-19 Suspected",     "warning-box"),
         }
         label, box_class = severity_map.get(
             result["predicted_class"], ("⚠️ Abnormality Detected", "warning-box")
@@ -528,16 +503,15 @@ def _render_results(result: dict):
         section_header("Class Probabilities")
         probs_sorted = sorted(result["probabilities"].items(), key=lambda x: -x[1])
         for cls_name, prob in probs_sorted:
-            col  = CLASS_COLORS.get(cls_name, "#4A90D9")
+            col = CLASS_COLORS.get(cls_name, "#4A90D9")
             confidence_bar(cls_name, prob, col)
 
-    # ── ROW 2: CT Images ──────────────────────────────────────────────────
     st.divider()
-    section_header("CT Scan Visualisations")
+    section_header("CT Scan Visualisations  (Grad-CAM++ · INFERNO)")
     img_cols = st.columns(3)
     img_data = [
         ("original_b64",  "Original CT Scan"),
-        ("heatmap_b64",   "Grad-CAM Heatmap"),
+        ("heatmap_b64",   "Grad-CAM++ Heatmap"),
         ("overlay_b64",   "Heatmap Overlay"),
     ]
     for col, (key, caption) in zip(img_cols, img_data):
@@ -545,25 +519,26 @@ def _render_results(result: dict):
             if key in result:
                 img = b64_to_pil(result[key])
                 st.image(img, use_column_width=True)
-                st.markdown(f'<div class="img-caption">{caption}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="img-caption">{caption}</div>',
+                            unsafe_allow_html=True)
 
     st.markdown("""
-    <div style="background:#1A2035;border:1px solid #2D3748;border-radius:8px;
-                padding:12px 16px;margin:8px 0;font-size:0.82rem;color:#A0AEC0">
-      🌡️ <strong>Grad-CAM Guide:</strong>
-      <span style="color:#FF4444">Red/Yellow</span> = high activation (most influential regions) &nbsp;|&nbsp;
-      <span style="color:#4444FF">Blue/Green</span> = low activation
+    <div class="info-box">
+      🌡️ <strong>Grad-CAM++ Guide (INFERNO palette):</strong>
+      <span style="color:#FCFFA4">Yellow/White</span> = highest activation ·
+      <span style="color:#F98C09">Orange</span> = moderate ·
+      <span style="color:#6B0CA9">Purple/Black</span> = low activation.
+      Grad-CAM++ uses second-order gradients for sharper, more localised maps
+      than vanilla Grad-CAM.
     </div>
     """, unsafe_allow_html=True)
 
-    # ── ROW 3: AI Report ──────────────────────────────────────────────────
     if "report" in result:
         report = result["report"]
         st.divider()
         source_badge = "🤖 GPT-4.1" if report.get("_source") == "openai" else "📋 Rule-based"
         section_header(f"AI Medical Report  [{source_badge}]")
 
-        # patient summary
         if "patient_summary" in report:
             st.markdown(f"""
             <div class="report-section">
@@ -572,14 +547,14 @@ def _render_results(result: dict):
             </div>
             """, unsafe_allow_html=True)
 
-        # clinical + confidence in 2 cols
         cli_col, conf_col = st.columns(2)
         with cli_col:
             if "clinical_interpretation" in report:
                 st.markdown(f"""
                 <div class="report-section">
                   <h4>🔬 Clinical Interpretation</h4>
-                  <p style="color:#CBD5E0;font-size:0.88rem;margin:0">{report['clinical_interpretation']}</p>
+                  <p style="color:#CBD5E0;font-size:0.88rem;margin:0">
+                    {report['clinical_interpretation']}</p>
                 </div>
                 """, unsafe_allow_html=True)
         with conf_col:
@@ -587,11 +562,11 @@ def _render_results(result: dict):
                 st.markdown(f"""
                 <div class="report-section">
                   <h4>📈 Confidence Explanation</h4>
-                  <p style="color:#CBD5E0;font-size:0.88rem;margin:0">{report['confidence_explanation']}</p>
+                  <p style="color:#CBD5E0;font-size:0.88rem;margin:0">
+                    {report['confidence_explanation']}</p>
                 </div>
                 """, unsafe_allow_html=True)
 
-        # abnormalities + actions
         abn_col, act_col = st.columns(2)
         with abn_col:
             if "key_abnormalities" in report:
@@ -618,7 +593,6 @@ def _render_results(result: dict):
                 </div>
                 """, unsafe_allow_html=True)
 
-        # emergency signs
         if "emergency_warning_signs" in report:
             items = "".join(
                 f"<li style='margin:3px 0;font-size:0.85rem'>{s}</li>"
@@ -631,13 +605,11 @@ def _render_results(result: dict):
             </div>
             """, unsafe_allow_html=True)
 
-        # disclaimer
         if "disclaimer" in report:
             st.markdown(f"""
             <div class="disclaimer-box">{report['disclaimer']}</div>
             """, unsafe_allow_html=True)
 
-    # ── DOWNLOAD JSON REPORT ──────────────────────────────────────────────
     st.divider()
     dl_col1, dl_col2, _ = st.columns([1, 1, 2])
     with dl_col1:
@@ -650,16 +622,17 @@ def _render_results(result: dict):
             use_container_width=True,
         )
     with dl_col2:
-        # download overlay image
         if "overlay_b64" in result:
             overlay_bytes = base64.b64decode(result["overlay_b64"])
             st.download_button(
-                "⬇️ Download Grad-CAM Image",
+                "⬇️ Download Grad-CAM++ Image",
                 data=overlay_bytes,
-                file_name="gradcam_overlay.png",
+                file_name="gradcampp_overlay.png",
                 mime="image/png",
                 use_container_width=True,
             )
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -706,7 +679,10 @@ def render_about():
     ]
     for col, (title, items) in zip(cols, arch_info):
         with col:
-            items_html = "".join(f"<li style='font-size:0.83rem;color:#CBD5E0;margin:3px 0'>{i}</li>" for i in items)
+            items_html = "".join(
+                f"<li style='font-size:0.83rem;color:#CBD5E0;margin:3px 0'>{i}</li>"
+                for i in items
+            )
             st.markdown(f"""
             <div class="metric-card">
               <div style="font-weight:600;color:#7EB8F7;margin-bottom:8px">{title}</div>
@@ -728,12 +704,33 @@ def render_about():
     """, unsafe_allow_html=True)
 
     st.markdown("""
+    <div class="report-section">
+      <h4>🔍 Explainability: Grad-CAM++ + SHAP</h4>
+      <p style="color:#CBD5E0;font-size:0.88rem">
+        <strong>Grad-CAM++</strong> extends vanilla Grad-CAM by using pixel-wise second-order
+        gradient weights (α<sup>c</sup><sub>ij</sub>) rather than global channel averages.
+        This produces sharper, more localised heatmaps that are robust when raw gradient
+        magnitudes are small — a common failure mode in cross-attention fusion architectures.
+        The INFERNO colourmap is used in place of JET for perceptual uniformity.
+      </p>
+      <p style="color:#CBD5E0;font-size:0.88rem;margin-top:8px">
+        <strong>SHAP</strong> (SHapley Additive exPlanations) uses <code>DeepExplainer</code>
+        with zero-vector baselines to attribute the predicted-class logit to each numerical
+        feature (WBC, NEUT%, NLR, CRP, PCT …).  The aggregate SHAP L1 norm is compared with
+        the Grad-CAM++ gradient norm to estimate what fraction of the decision came from
+        the CT image vs. laboratory values.  The Grad-CAM++ heatmap is then re-scaled by
+        this <em>image weight</em>, preventing misleadingly high-activation maps when the
+        model was primarily driven by lab results.
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
     <div class="disclaimer-box">
       <strong>⚠️ Important Medical Disclaimer</strong><br>
       PneumoFusion-Net is a <strong>research prototype</strong> and is NOT approved as a medical
       device. All predictions are AI-assisted estimates and must be reviewed by a qualified
-      healthcare professional before any clinical action is taken. The system may produce errors,
-      particularly in atypical or rare presentations.
+      healthcare professional before any clinical action is taken.
     </div>
     """, unsafe_allow_html=True)
 

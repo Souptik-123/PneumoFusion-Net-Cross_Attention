@@ -57,7 +57,7 @@ import torch
 # PATHS
 # ─────────────────────────────────────────────
 DATA_ROOT   = "."
-CSV_PATH    = "unified_dataset_new1.csv"
+CSV_PATH    = r"E:\4thYearProjectCoding\dataset\unified_dataset_new3.csv"
 OUTPUT_DIR  = "outputs"
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
 LOG_DIR        = os.path.join(OUTPUT_DIR, "logs")
@@ -151,7 +151,7 @@ DROPOUT_RATE   = 0.5             # was 0.3
 MIXUP_ALPHA    = 0.4             # was 0.3
 
 SEED           = 42
-MIXED_PRECISION = False
+MIXED_PRECISION =False
 
 # Fine-tuning phase
 FINETUNE_EPOCHS = 20

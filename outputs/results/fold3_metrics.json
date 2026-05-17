@@ -1,0 +1,19 @@
+{
+  "accuracy": 0.9865168539325843,
+  "precision": 0.9865668012921525,
+  "recall": 0.9865168539325844,
+  "f1_macro": 0.9865179656858079,
+  "f1_weighted": 0.9865179656858076,
+  "roc_auc": 0.9995305201363465,
+  "specificity_Bacterial_Pneumonia": 0.9971910112359551,
+  "specificity_Corona_Virus_Disease": 0.9992977528089888,
+  "specificity_Normal": 0.9929775280898876,
+  "specificity_Tuberculosis": 0.9985955056179775,
+  "specificity_Viral_Pneumonia": 0.9950842696629213,
+  "specificity_macro": 0.996629213483146,
+  "f1_Bacterial_Pneumonia": 0.9901823281907434,
+  "f1_Corona_Virus_Disease": 0.9929478138222849,
+  "f1_Normal": 0.9805013927576601,
+  "f1_Tuberculosis": 0.9943820224719101,
+  "f1_Viral_Pneumonia": 0.9745762711864406
+}
