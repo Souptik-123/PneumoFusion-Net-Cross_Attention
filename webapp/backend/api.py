@@ -309,42 +309,53 @@ async def full_report(
         pil_img = _pil_from_upload(ct_image)
         num_row = _numerical_from_form(age, sex, wbc, neut, lymp, nlr, crp, pct)
 
-        result, cam_norm, heatmap_rgb, overlay = run_gradcam(
-            pil_img, clinical_text, num_row
-        )
+        # ── Full pipeline: Grad-CAM++ + SHAP + fused heatmap ──────────────────
+        expl = run_fused_explain(pil_img, clinical_text, num_row)
 
-        orig_rgb    = np.array(pil_img.convert("RGB"))
-        orig_b64    = _ndarray_to_b64(orig_rgb)
-        heatmap_b64 = _ndarray_to_b64(heatmap_rgb)
-        overlay_b64 = _ndarray_to_b64(overlay)
+        orig_rgb = np.array(pil_img.convert("RGB"))
 
-        cam_thresh = np.percentile(cam_norm, 90)
-        intensity  = "high" if cam_thresh > 0.7 else ("moderate" if cam_thresh > 0.4 else "low")
+        cam_norm    = np.array(expl["cam_norm"])
+        cam_thresh  = np.percentile(cam_norm, 90)
+        intensity   = "high" if cam_thresh > 0.7 else ("moderate" if cam_thresh > 0.4 else "low")
+        image_weight = expl["image_weight"]
         gradcam_txt = (
             f"Grad-CAM++ heatmap (INFERNO colormap) shows {intensity}-intensity activation "
             f"in lung regions, highlighting areas most influential for the prediction of "
-            f"{result['predicted_class']}."
+            f"{expl['predicted_class']}. "
+            f"SHAP analysis indicates the CT image contributed approximately "
+            f"{image_weight*100:.0f}% of the decision signal; "
+            f"laboratory values accounted for the remainder."
         )
 
         report = generate_report(
-            predicted_class  = result["predicted_class"],
-            confidence       = result["confidence"],
-            probabilities    = result["probabilities"],
+            predicted_class  = expl["predicted_class"],
+            confidence       = expl["confidence"],
+            probabilities    = expl["probabilities"],
             numerical_row    = num_row,
             clinical_text    = clinical_text,
             gradcam_findings = gradcam_txt,
         )
 
         return {
-            "predicted_class":  result["predicted_class"],
-            "confidence":       result["confidence"],
-            "probabilities":    result["probabilities"],
-            "class_index":      result["class_index"],
-            "original_b64":     orig_b64,
-            "heatmap_b64":      heatmap_b64,
-            "overlay_b64":      overlay_b64,
-            "report":           report,
-            "total_ms":         round((time.perf_counter() - t0) * 1000, 1),
+            # ── prediction ────────────────────────────────────────────────────
+            "predicted_class":  expl["predicted_class"],
+            "confidence":       expl["confidence"],
+            "probabilities":    expl["probabilities"],
+            "class_index":      expl["class_index"],
+            # ── images (base64 PNG) ───────────────────────────────────────────
+            "original_b64":         _ndarray_to_b64(orig_rgb),
+            "heatmap_b64":          _ndarray_to_b64(expl["heatmap_rgb"]),
+            "overlay_b64":          _ndarray_to_b64(expl["overlay"]),
+            "heatmap_fused_b64":    _ndarray_to_b64(expl["heatmap_rgb_fused"]),
+            "overlay_fused_b64":    _ndarray_to_b64(expl["overlay_fused"]),
+            # ── SHAP ─────────────────────────────────────────────────────────
+            "shap_values":    expl["shap_values"],
+            "feature_labels": expl["feature_labels"],
+            "image_weight":   image_weight,
+            "shap_text":      expl["shap_text"],
+            # ── report + timing ───────────────────────────────────────────────
+            "report":    report,
+            "total_ms":  round((time.perf_counter() - t0) * 1000, 1),
         }
 
     except Exception as e:

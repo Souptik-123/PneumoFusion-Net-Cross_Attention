@@ -379,7 +379,13 @@ class _NumericalWrapper(nn.Module):
         self.register_buffer("txt_t", txt_t)
 
     def forward(self, num_t: torch.Tensor) -> torch.Tensor:
-        return self.model(self.img_t, self.txt_t, num_t)
+        batch_size = num_t.size(0)
+
+    # Expand frozen modalities to SHAP batch size
+        img = self.img_t.expand(batch_size, -1, -1, -1)
+        txt = self.txt_t.expand(batch_size, -1)
+
+        return self.model(img, txt, num_t)
 
 
 class SHAPExplainer:
@@ -406,45 +412,44 @@ class SHAPExplainer:
 
     # human-readable labels for the scaler output columns
     FEATURE_LABELS = [
+        "Patient Age",
         "WBC (×10⁹/L)", "NEUT%", "LYMP%", "NLR",
-        "CRP (mg/L)", "PCT (ng/mL)",
-        "Sex: Female", "Sex: Male",
+        "CRP (mg/L)", "PCT (ng/mL)"
     ]
 
     def __init__(self, model: PneumoFusionNet):
         self.model = model
 
     def explain(
-        self,
-        img_t:         torch.Tensor,
-        txt_t:         torch.Tensor,
-        num_t:         torch.Tensor,
-        target_class:  int,
-        cam_grad_norm: float = 1.0,
-        n_background:  int   = 20,
+    self,
+    img_t:         torch.Tensor,
+    txt_t:         torch.Tensor,
+    num_t:         torch.Tensor,
+    target_class:  int,
+    image_score: float = 1.0,
+    n_background:  int   = 20,   # kept only for compatibility
     ) -> Tuple[np.ndarray, List[str], float]:
         """
-        Parameters
-        ----------
-        cam_grad_norm   Gradient L2 norm from Grad-CAM++ — proxy for image energy.
-        n_background    Number of zero-baseline samples for DeepExplainer.
+        Stable explainability implementation using Gradient × Input.
+
+        Why not SHAP DeepExplainer?
+        ---------------------------
+        DeepExplainer is unstable with:
+        • ResNet residual connections
+        • backward hooks (Grad-CAM++)
+        • BiLSTM/cuDNN
+        • attention transformers
+        • inplace ops inside torchvision
+
+        Gradient × Input is significantly more stable and still provides
+        meaningful per-feature attribution scores for numerical features.
 
         Returns
         -------
-        shap_vals    (N_features,) for the predicted class
-        feat_labels  list of strings
-        image_weight float ∈ [0,1]
+        vals          : (N_features,) attribution values
+        feat_labels   : feature names
+        image_weight  : relative contribution of image modality
         """
-        try:
-            import shap  # lazy import — not mandatory at startup
-        except ImportError:
-            # graceful degradation: return zero SHAP values
-            n = num_t.shape[1]
-            return (
-                np.zeros(n, dtype=np.float32),
-                self.FEATURE_LABELS[:n],
-                0.5,
-            )
 
         self.model.eval()
 
@@ -453,47 +458,67 @@ class SHAPExplainer:
             img_t.detach().to(DEVICE),
             txt_t.detach().to(DEVICE),
         ).to(DEVICE)
+
         wrapper.eval()
 
-        # background: n_background copies of a zero tensor (scaled baseline)
-        background = torch.zeros(n_background, num_t.shape[1],
-                                  dtype=torch.float32).to(DEVICE)
-        foreground = num_t.detach().to(DEVICE)
+        # Numerical tensor requiring gradients
+        foreground_req = (
+            num_t.detach()
+            .clone()
+            .to(DEVICE)
+            .requires_grad_(True)
+        )
 
-        try:
-            explainer   = shap.DeepExplainer(wrapper, background)
-            # shap_values shape: (n_classes, 1, n_features) or list of arrays
-            shap_values = explainer.shap_values(foreground)
+        # ---------------------------------------------------------
+        # cuDNN RNN backward fix
+        # ---------------------------------------------------------
+        # PyTorch requires RNN/LSTM modules to be in train mode
+        # during backward() when using cuDNN.
+        self.model.text_encoder.bilstm.train()
 
-            # Normalise output format across shap versions
-            if isinstance(shap_values, list):
-                # list of (1, n_features) arrays, one per class
-                sv = np.array([v[0] for v in shap_values])   # (n_classes, n_features)
-            else:
-                # (1, n_features, n_classes) — older shap
-                sv = shap_values[0].T   # (n_classes, n_features)
+        wrapper.zero_grad()
+        self.model.zero_grad()
 
-            vals = sv[target_class]    # (n_features,)
+        # Forward pass
+        out = wrapper(foreground_req)
 
-        except Exception as exc:
-            print(f"[SHAPExplainer] DeepExplainer failed ({exc}); falling back to gradient SHAP")
-            # Fallback: gradient × input as a simple attribution
-            foreground.requires_grad_(True)
-            out = wrapper(foreground)
-            score = out[0, target_class]
-            score.backward()
-            vals = (foreground.grad[0] * foreground[0]).detach().cpu().numpy()
+        # Target class score
+        score = out[0, target_class]
 
-        # ── Compute image weight from gradient norms ─────────────────────────
-        shap_l1     = float(np.abs(vals).sum()) + 1e-8
-        image_weight = cam_grad_norm / (cam_grad_norm + shap_l1)
-        # clip to [0.15, 0.95] so the heatmap is never invisible or blindly trusted
-        image_weight = float(np.clip(image_weight, 0.15, 0.95))
+        # Backward pass
+        score.backward()
 
+        # ---------------------------------------------------------
+        # Gradient × Input attribution
+        # ---------------------------------------------------------
+        vals = (
+            foreground_req.grad[0] * foreground_req[0]
+        ).detach().cpu().numpy()
+
+        # Restore eval mode
+        self.model.text_encoder.bilstm.eval()
+
+        # ---------------------------------------------------------
+        # Compute image modality contribution
+        # ---------------------------------------------------------
+        lab_score = float(np.mean(np.abs(vals))) + 1e-8
+
+        image_weight = image_score / (
+        image_score + lab_score)
+        # Prevent extreme values
+        image_weight = float(
+            np.clip(image_weight, 0.15, 0.95)
+        )
+
+        # Feature labels
         n_features = num_t.shape[1]
         labels = self.FEATURE_LABELS[:n_features]
 
-        return vals.astype(np.float32), labels, image_weight
+        return (
+            vals.astype(np.float32),
+            labels,
+            image_weight,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -561,15 +586,14 @@ class FusedExplainer:
                 img_t, txt_t, num_t, target, image
             )
             cam_grad_norm = cam_extractor.gradient_norm()
+            image_score = float(np.mean(cam_norm))
         finally:
             cam_extractor.remove_hooks()
             loader.model.eval()
 
         # ── Pass 3: SHAP ─────────────────────────────────────────────────────
         shap_explainer = SHAPExplainer(loader.model)
-        shap_vals, feat_labels, image_weight = shap_explainer.explain(
-            img_t, txt_t, num_t, target, cam_grad_norm=cam_grad_norm
-        )
+        shap_vals, feat_labels, image_weight = shap_explainer.explain(img_t,txt_t,num_t,target,image_score=image_score,)
 
         # ── Pass 4: Re-weight heatmap by image contribution ──────────────────
         # Scale the cam_norm map so its peak equals image_weight.
@@ -606,55 +630,77 @@ class FusedExplainer:
             "shap_text":      shap_text,
         }
 
-
 def _build_shap_narrative(
-    shap_vals:    np.ndarray,
-    feat_labels:  List[str],
-    pred_class:   str,
+    shap_vals: np.ndarray,
+    feat_labels: List[str],
+    pred_class: str,
     image_weight: float,
 ) -> str:
-    """Produce a one-paragraph narrative summarising SHAP + image weight."""
-    # top 3 positive contributors
-    order      = np.argsort(shap_vals)[::-1]
-    pos_feats  = [(feat_labels[i], float(shap_vals[i])) for i in order if shap_vals[i] > 0][:3]
-    neg_feats  = [(feat_labels[i], float(shap_vals[i])) for i in order[::-1] if shap_vals[i] < 0][:2]
 
-    img_pct  = round(image_weight * 100)
-    lab_pct  = round((1.0 - image_weight) * 100)
+    shap_vals = np.array(shap_vals).flatten()
+
+    n = min(len(shap_vals), len(feat_labels))
+
+    shap_vals = shap_vals[:7]
+    feat_labels = feat_labels[:7]
+
+    order = np.argsort(shap_vals)[::-1]
+
+    pos_feats = [
+        (feat_labels[i], float(shap_vals[i]))
+        for i in order
+        if shap_vals[i] > 0
+    ][:3]
+
+    neg_feats = [
+        (feat_labels[i], float(shap_vals[i]))
+        for i in order[::-1]
+        if shap_vals[i] < 0
+    ][:2]
+
+    img_pct = round(image_weight * 100)
+    lab_pct = round((1.0 - image_weight) * 100)
 
     parts = [
-        f"For the prediction of **{pred_class}**, the model drew "
-        f"approximately **{img_pct}%** of its decision signal from the CT image "
-        f"and **{lab_pct}%** from laboratory values and clinical text."
+        f"For the prediction of {pred_class}, "
+        f"the model relied approximately "
+        f"{img_pct}% on CT imaging and "
+        f"{lab_pct}% on laboratory/text features."
     ]
 
     if pos_feats:
         drivers = ", ".join(
-            f"{name} (SHAP={v:+.3f})" for name, v in pos_feats
+            f"{name} ({v:+.3f})"
+            for name, v in pos_feats
         )
-        parts.append(f"The strongest lab drivers pushing *towards* this prediction were: {drivers}.")
+
+        parts.append(
+            f"Strongest positive contributors: {drivers}."
+        )
 
     if neg_feats:
         contra = ", ".join(
-            f"{name} (SHAP={v:+.3f})" for name, v in neg_feats
+            f"{name} ({v:+.3f})"
+            for name, v in neg_feats
         )
-        parts.append(f"Features pulling *away* from this prediction: {contra}.")
+
+        parts.append(
+            f"Features reducing confidence: {contra}."
+        )
 
     if image_weight < 0.35:
         parts.append(
-            "⚠️ The Grad-CAM++ heatmap has been dimmed to reflect the model's "
-            "relatively low reliance on the CT scan for this particular case — "
-            "laboratory values were more informative."
+            "The prediction relied more heavily on "
+            "laboratory/text information than CT imaging."
         )
+
     elif image_weight > 0.70:
         parts.append(
-            "The CT image was the dominant information source. "
-            "The Grad-CAM++ heatmap should be interpreted with high confidence."
+            "CT imaging was the dominant contributor "
+            "to this prediction."
         )
 
-    return "  ".join(parts)
-
-
+    return " ".join(parts)
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API  (unchanged signatures + new run_fused_explain)
 # ─────────────────────────────────────────────────────────────────────────────

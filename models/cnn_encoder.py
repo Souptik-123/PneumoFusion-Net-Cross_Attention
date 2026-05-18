@@ -47,6 +47,13 @@ class CNNImageEncoder(nn.Module):
         # ── Load backbone ─────────────────────────────────────────────────
         weights  = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = resnet50(weights=weights)
+        def disable_inplace_relu(module):
+            for child in module.children():
+                if isinstance(child, nn.ReLU):
+                    child.inplace = False
+                disable_inplace_relu(child)
+
+        disable_inplace_relu(backbone)
 
         # ── Adapt first conv: 3-channel → 1-channel ───────────────────────
         # Sum the RGB weights so low-level feature detectors are preserved.
@@ -86,7 +93,7 @@ class CNNImageEncoder(nn.Module):
             nn.Flatten(),
             nn.Linear(2048, out_dim),
             nn.BatchNorm1d(out_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Dropout(0.3),
         )
 

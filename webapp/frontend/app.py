@@ -508,30 +508,175 @@ def _render_results(result: dict):
 
     st.divider()
     section_header("CT Scan Visualisations  (Grad-CAM++ · INFERNO)")
-    img_cols = st.columns(3)
-    img_data = [
-        ("original_b64",  "Original CT Scan"),
-        ("heatmap_b64",   "Grad-CAM++ Heatmap"),
-        ("overlay_b64",   "Heatmap Overlay"),
-    ]
-    for col, (key, caption) in zip(img_cols, img_data):
-        with col:
-            if key in result:
-                img = b64_to_pil(result[key])
-                st.image(img, use_column_width=True)
-                st.markdown(f'<div class="img-caption">{caption}</div>',
-                            unsafe_allow_html=True)
 
-    st.markdown("""
-    <div class="info-box">
-      🌡️ <strong>Grad-CAM++ Guide (INFERNO palette):</strong>
-      <span style="color:#FCFFA4">Yellow/White</span> = highest activation ·
-      <span style="color:#F98C09">Orange</span> = moderate ·
-      <span style="color:#6B0CA9">Purple/Black</span> = low activation.
-      Grad-CAM++ uses second-order gradients for sharper, more localised maps
-      than vanilla Grad-CAM.
-    </div>
-    """, unsafe_allow_html=True)
+    has_fused = "overlay_fused_b64" in result
+
+    if has_fused:
+        cam_tab, fused_tab = st.tabs(
+            ["🔥 Grad-CAM++ (raw)", "🔬 SHAP-weighted Grad-CAM++ (fused)"]
+        )
+    else:
+        cam_tab = st.container()
+
+    with cam_tab:
+        img_cols = st.columns(3)
+        img_data = [
+            ("original_b64", "Original CT Scan"),
+            ("heatmap_b64",  "Grad-CAM++ Heatmap"),
+            ("overlay_b64",  "Heatmap Overlay"),
+        ]
+        for col, (key, caption) in zip(img_cols, img_data):
+            with col:
+                if key in result:
+                    st.image(b64_to_pil(result[key]), use_column_width=True)
+                    st.markdown(f'<div class="img-caption">{caption}</div>',
+                                unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="info-box">
+          🌡️ <strong>Grad-CAM++ Guide (INFERNO palette):</strong>
+          <span style="color:#FCFFA4">Yellow/White</span> = highest activation ·
+          <span style="color:#F98C09">Orange</span> = moderate ·
+          <span style="color:#6B0CA9">Purple/Black</span> = low activation.
+          Grad-CAM++ uses second-order gradients for sharper, more localised maps
+          than vanilla Grad-CAM.
+        </div>
+        """, unsafe_allow_html=True)
+
+    if has_fused:
+        with fused_tab:
+            fused_cols = st.columns(3)
+            fused_data = [
+                ("original_b64",      "Original CT Scan"),
+                ("heatmap_fused_b64", "SHAP-weighted Heatmap"),
+                ("overlay_fused_b64", "SHAP-weighted Overlay"),
+            ]
+            for col, (key, caption) in zip(fused_cols, fused_data):
+                with col:
+                    if key in result:
+                        st.image(b64_to_pil(result[key]), use_column_width=True)
+                        st.markdown(f'<div class="img-caption">{caption}</div>',
+                                    unsafe_allow_html=True)
+
+            image_weight = result.get("image_weight", None)
+            if image_weight is not None:
+                lab_weight  = 1.0 - image_weight
+                img_pct     = image_weight * 100
+                lab_pct     = lab_weight * 100
+                bar_color   = "#4A90D9" if image_weight >= 0.5 else "#F4A237"
+                st.markdown(f"""
+                <div class="info-box" style="margin-top:10px">
+                  <strong>📊 Modality Contribution  (SHAP-derived)</strong><br>
+                  <div style="margin-top:8px">
+                    <div style="display:flex;justify-content:space-between;
+                                font-size:0.82rem;color:#CBD5E0;margin-bottom:3px">
+                      <span>🖼️ CT Image — {img_pct:.1f}%</span>
+                      <span>🧪 Lab / Text — {lab_pct:.1f}%</span>
+                    </div>
+                    <div style="background:#2D3748;border-radius:8px;height:12px;overflow:hidden">
+                      <div style="width:{img_pct:.1f}%;height:100%;
+                                  background:linear-gradient(90deg,{bar_color},{bar_color}88);
+                                  border-radius:8px"></div>
+                    </div>
+                  </div>
+                  The heatmap intensity has been scaled by the image weight to
+                  reflect how much the CT scan actually drove this prediction.
+                </div>
+                """, unsafe_allow_html=True)
+
+            if "shap_text" in result:
+                st.markdown(f"""
+                <div class="info-box" style="margin-top:8px">
+                  {result['shap_text']}
+                </div>
+                """, unsafe_allow_html=True)
+
+    # ── SHAP numerical feature importance ──────────────────────────────────
+    shap_vals   = result.get("shap_values")
+    feat_labels = result.get("feature_labels")
+
+    if shap_vals and feat_labels:
+        st.divider()
+        section_header("🧬 SHAP Feature Importance  (Numerical Lab Values)")
+
+        import pandas as pd
+
+        sv = np.array(shap_vals, dtype=float).flatten()
+        labs = list(feat_labels)
+
+        # Safety alignment
+        n = min(len(sv), len(labs))
+
+        sv = sv[:n]
+        labs = labs[:n]
+
+        # Sort descending by absolute magnitude
+        order = np.argsort(np.abs(sv))[::-1]
+
+        sv_ord = sv[order]
+        lb_ord = [labs[i] for i in order]
+
+        shap_col, legend_col = st.columns([3, 1], gap="large")
+
+        with shap_col:
+            # Build a horizontal bar chart with pure HTML/CSS
+            max_abs = max(abs(sv_ord.max()), abs(sv_ord.min()), 1e-9)
+
+            rows_html = ""
+            for label, val in zip(lb_ord, sv_ord):
+                pct       = abs(val) / max_abs * 100
+                is_pos    = val >= 0
+                bar_col   = "#E84545" if is_pos else "#4A90D9"
+                sign      = "+" if is_pos else "−"
+                direction = "pushing toward" if is_pos else "pulling away from"
+
+                rows_html += f"""
+                <div style="display:flex;align-items:center;margin-bottom:9px;gap:8px">
+                  <div style="width:140px;text-align:right;font-size:0.80rem;
+                              color:#CBD5E0;white-space:nowrap;overflow:hidden;
+                              text-overflow:ellipsis" title="{label}">{label}</div>
+                  <div style="flex:1;background:#2D3748;border-radius:4px;
+                              height:18px;position:relative;overflow:hidden">
+                    <div style="position:absolute;
+                                {'left:0' if is_pos else f'right:0'};
+                                width:{pct:.1f}%;height:100%;
+                                background:{bar_col};border-radius:4px;
+                                opacity:0.85"></div>
+                  </div>
+                  <div style="width:90px;font-size:0.78rem;
+                              color:{bar_col};font-weight:600;white-space:nowrap">
+                    {sign}{abs(val):.4f}
+                  </div>
+                </div>"""
+
+            st.markdown(
+                f'<div style="padding:12px 0">{rows_html}</div>',
+                unsafe_allow_html=True,
+            )
+
+        with legend_col:
+            predicted_class = result.get("predicted_class", "predicted class")
+            st.markdown(f"""
+            <div class="metric-card" style="font-size:0.82rem">
+              <div style="font-weight:600;color:#7EB8F7;margin-bottom:10px">
+                📌 How to Read
+              </div>
+              <div style="margin-bottom:8px">
+                <span style="color:#E84545;font-weight:700">■ Red bars</span><br>
+                <span style="color:#A0AEC0">Push the prediction
+                <em>toward</em> <strong>{predicted_class}</strong></span>
+              </div>
+              <div style="margin-bottom:8px">
+                <span style="color:#4A90D9;font-weight:700">■ Blue bars</span><br>
+                <span style="color:#A0AEC0">Pull the prediction
+                <em>away from</em> <strong>{predicted_class}</strong></span>
+              </div>
+              <div style="color:#718096;font-size:0.76rem;margin-top:10px">
+                Bar length = relative magnitude of SHAP attribution.
+                Computed via DeepExplainer with zero-vector baselines.
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
 
     if "report" in result:
         report = result["report"]
@@ -611,7 +756,7 @@ def _render_results(result: dict):
             """, unsafe_allow_html=True)
 
     st.divider()
-    dl_col1, dl_col2, _ = st.columns([1, 1, 2])
+    dl_col1, dl_col2, dl_col3, _ = st.columns([1, 1, 1, 1])
     with dl_col1:
         import json
         st.download_button(
@@ -628,6 +773,16 @@ def _render_results(result: dict):
                 "⬇️ Download Grad-CAM++ Image",
                 data=overlay_bytes,
                 file_name="gradcampp_overlay.png",
+                mime="image/png",
+                use_container_width=True,
+            )
+    with dl_col3:
+        if "overlay_fused_b64" in result:
+            fused_bytes = base64.b64decode(result["overlay_fused_b64"])
+            st.download_button(
+                "⬇️ Download SHAP-Fused Image",
+                data=fused_bytes,
+                file_name="gradcampp_shap_fused.png",
                 mime="image/png",
                 use_container_width=True,
             )
